@@ -51,7 +51,7 @@ except ImportError:
 # Shared fixed-index mapping
 # -----------------------------------------------------------------------------
 
-APP_TITLE = "DFCI AIO - Fixed Index v6"
+APP_TITLE = "DFCI AIO - Fixed Index v8"
 FNT_HEADER_SIZE = 0x3E
 GLYPH_RECORD_SIZE = 0x16
 GXT_HEADER_SIZE = 0x40
@@ -331,6 +331,72 @@ def base_latin_char(char: str) -> str:
     return char
 
 
+# Vietnamese letters carrying the below-dot mark.  The value is the same
+# letter shape with ONLY the below-dot removed.  This lets the builder keep
+# the body/accent top where it belongs while allowing the dot to extend below.
+DOT_BELOW_REFERENCE = {
+    "ạ": "a", "ậ": "â", "ặ": "ă",
+    "ẹ": "e", "ệ": "ê",
+    "ị": "i",
+    "ọ": "o", "ộ": "ô", "ợ": "ơ",
+    "ụ": "u", "ự": "ư",
+    "ỵ": "y",
+    "Ạ": "A", "Ậ": "Â", "Ặ": "Ă",
+    "Ẹ": "E", "Ệ": "Ê",
+    "Ị": "I",
+    "Ọ": "O", "Ộ": "Ô", "Ợ": "Ơ",
+    "Ụ": "U", "Ự": "Ư",
+    "Ỵ": "Y",
+}
+
+
+def _ttf_render_top(font_path: Path, char: str, font_size: int, baseline: int) -> int:
+    """Return the cropped glyph top, in the same coordinate system as FNT neg_top."""
+    font = ImageFont.truetype(str(font_path), font_size)
+    probe = Image.new("L", (192, 192), 0)
+    draw = ImageDraw.Draw(probe)
+    bbox = draw.textbbox((0, 0), char, font=font, anchor="ls")
+    if bbox is None:
+        raise ValueError(f"TTF không có glyph cho {char!r}.")
+    l, t, r, b = bbox
+    w0, h0 = max(1, r-l), max(1, b-t)
+    img = Image.new("L", (w0, h0), 0)
+    d = ImageDraw.Draw(img)
+    d.text((-l, -t), char, font=font, fill=255, anchor="ls")
+    baseline_in_crop = -t
+    bb = img.getbbox()
+    if bb:
+        _, top_trim, _, _ = bb
+        baseline_in_crop -= top_trim
+    return baseline - baseline_in_crop
+
+
+def auto_all_negtop(font_path: Path, char: str, font_size: int, baseline: int,
+                    ascii_metrics: dict[str, Glyph]) -> int:
+    """Infer Neg Top for every Vietnamese glyph from the stock Latin body.
+
+    The stock ASCII letter supplies the game's vertical anchor.  The selected
+    TTF supplies only the relative accent/diacritic displacement.  This keeps
+    the body of á/à/ả/ã/â/ă/... aligned with stock ``a`` while still allowing
+    each accent to occupy its natural space.  The same rule applies to every
+    one of the 134 fixed-map characters, upper and lower case.
+
+    For below-dot letters, the dot remains part of the bitmap height and is
+    allowed to extend below the nominal cell rather than pushing the whole
+    body upward.
+    """
+    base = base_latin_char(char)
+    stock = ascii_metrics.get(base)
+    ttf_base_top = _ttf_render_top(font_path, base, font_size, baseline)
+    ttf_char_top = _ttf_render_top(font_path, char, font_size, baseline)
+
+    # Anchor the unaccented body to the game's own ASCII metric whenever
+    # possible.  Accent positioning comes from the TTF as a relative delta.
+    base_top = -stock.neg_top if stock is not None else ttf_base_top
+    accent_delta = ttf_char_top - ttf_base_top
+    return int(round(base_top + accent_delta))
+
+
 def stock_ascii_metrics(glyphs: list[Glyph]) -> dict[str, Glyph]:
     out = {}
     for g in glyphs:
@@ -396,11 +462,14 @@ def auto_fit_font_metrics(font_path: Path, glyphs: list[Glyph], min_size: int = 
 
 
 def render_glyph(font_path: Path, char: str, font_size: int, baseline: int,
-                 cell_height: int, advance: int):
-    """Render at the chosen body scale; do not shrink just because of accents.
+                 cell_height: int, advance: int, *, forced_top: int | None = None,
+                 allow_below: bool = False):
+    """Render at the chosen body scale while preserving Vietnamese marks.
 
-    Width is compressed only when it exceeds the stock advance. Vertical scaling
-    is a last resort only when the full glyph truly cannot fit in the cell.
+    ``forced_top`` can anchor any Vietnamese glyph to the stock Latin body
+    metrics.  For below-dot glyphs, ``allow_below`` additionally lets the dot
+    extend beneath the nominal cell instead of moving the whole character
+    upward.  The returned ``top`` becomes -neg_top.
     """
     font = ImageFont.truetype(str(font_path), font_size)
     probe = Image.new("L", (192, 192), 0)
@@ -424,28 +493,33 @@ def render_glyph(font_path: Path, char: str, font_size: int, baseline: int,
 
     w, h = img.size
 
-    # Preserve vertical size.  If the horn/accent makes the glyph a little wider,
-    # compress only X instead of shrinking the whole character.
+    # Preserve vertical size.  Horns/accents may make a glyph wider than the
+    # stock cell; compress X only rather than shrinking the entire character.
     if w > advance:
         img = img.resize((max(1, advance), h), Image.Resampling.LANCZOS)
         w, h = img.size
 
-    # Only full-scale down if the accent + body physically exceeds the cell.
-    if h > cell_height:
+    # A below-dot glyph is intentionally allowed to grow below the nominal
+    # 22px cell.  Scaling it to cell_height is exactly what made the body small
+    # and/or shifted upward in older builds.
+    if not allow_below and h > cell_height:
         ratio = cell_height / h
         nw = max(1, min(advance, round(w * ratio)))
         img = img.resize((nw, cell_height), Image.Resampling.LANCZOS)
         baseline_in_crop = round(baseline_in_crop * ratio)
         w, h = img.size
 
-    top = baseline - baseline_in_crop
+    natural_top = baseline - baseline_in_crop
+    top = forced_top if forced_top is not None else natural_top
     if top < 0:
         top = 0
-    if top + h > cell_height:
-        # Shift upward instead of shrinking. Important for dot-below letters.
+
+    if not allow_below and top + h > cell_height:
+        # Normal glyphs keep the old cell guard.
         top = max(0, cell_height - h)
 
-    return img, top
+    return img, int(top)
+
 
 def paint_glyph(linear: bytearray, alpha_img: Image.Image, x: int, y: int):
     pix = alpha_img.tobytes()
@@ -662,6 +736,7 @@ class FontToolTab(ttk.Frame):
         self.advance_var = tk.IntVar(value=11)
         self.padding_var = tk.IntVar(value=1)
         self.auto_fit_var = tk.BooleanVar(value=True)
+        self.auto_all_negtop_var = tk.BooleanVar(value=True)
         self.build_ui()
 
     def build_ui(self):
@@ -685,9 +760,12 @@ class FontToolTab(ttk.Frame):
             ttk.Spinbox(opts, from_=0, to=64, textvariable=var, width=6).grid(row=0, column=col * 2 + 1, sticky="w", padx=(0, 10))
         ttk.Checkbutton(
             opts, text="Auto-fit size/baseline theo Latin gốc", variable=self.auto_fit_var
-        ).grid(row=1, column=0, columnspan=5, sticky="w", padx=6, pady=(4, 0))
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        ttk.Checkbutton(
+            opts, text="Auto Neg Top toàn bộ 134 chữ Việt", variable=self.auto_all_negtop_var
+        ).grid(row=1, column=4, columnspan=4, sticky="w", padx=6, pady=(4, 0))
         ttk.Button(opts, text="Đo size gốc ngay", command=self.measure_original_metrics).grid(
-            row=1, column=5, columnspan=3, sticky="w", padx=6, pady=(4, 0)
+            row=1, column=8, columnspan=2, sticky="w", padx=6, pady=(4, 0)
         )
 
         mapbox = ttk.LabelFrame(self, text="Built-in fixed-index map", padding=10)
@@ -846,6 +924,14 @@ class FontToolTab(ttk.Frame):
                 )
 
             ascii_metrics = stock_ascii_metrics(glyphs)
+            if self.auto_all_negtop_var.get():
+                self.log.write_line(
+                    f"Auto Neg Top toàn bộ: ON ({FIXED_COUNT} ký tự); "
+                    "mỗi glyph neo thân theo Latin gốc, độ lệch dấu lấy từ TTF."
+                )
+                self.log.write_line(
+                    f"Dấu nặng: {len(DOT_BELOW_REFERENCE)} ký tự được phép kéo bitmap xuống dưới cell thay vì đẩy thân chữ lên."
+                )
 
             self.log.write_line(
                 f"Fixed-index mode: FNT #{FIXED_START_INDEX}..#{FIXED_END_INDEX}; "
@@ -868,7 +954,19 @@ class FontToolTab(ttk.Frame):
                 base = base_latin_char(char)
                 ref = ascii_metrics.get(base)
                 char_advance = ref.advance if ref is not None and ref.advance > 0 else advance
-                alpha, top = render_glyph(ttf, char, font_size, baseline, cell_h, char_advance)
+
+                is_dot_below = char in DOT_BELOW_REFERENCE
+                forced_top = None
+                if self.auto_all_negtop_var.get():
+                    forced_top = auto_all_negtop(
+                        ttf, char, font_size, baseline, ascii_metrics
+                    )
+
+                alpha, top = render_glyph(
+                    ttf, char, font_size, baseline, cell_h, char_advance,
+                    forced_top=forced_top,
+                    allow_below=(is_dot_below and self.auto_all_negtop_var.get()),
+                )
                 w, h = alpha.size
                 pos = find_space(occ, w, h, padding)
                 if pos is None:
@@ -894,10 +992,17 @@ class FontToolTab(ttk.Frame):
                     atlas_y=ay,
                 )
                 raw = code_to_raw_bytes(preserved_code)
+                auto_note = ""
+                if self.auto_all_negtop_var.get():
+                    auto_note = f" autoNegTop={-top}"
+                    if is_dot_below:
+                        overflow = max(0, top + h - cell_h)
+                        auto_note += f" below+{overflow}px"
                 self.log.write_line(
                     f"[{order:03d}/{FIXED_COUNT}] FNT #{fnt_idx:04d}  {char}  "
                     f"code=0x{preserved_code:04X} [{raw.hex(' ').upper()}]  "
                     f"page {page:02d} ({ax},{ay}) {w}x{h} adv={char_advance} top={top}"
+                    f" negTop={-top}{auto_note}"
                 )
 
             out.mkdir(parents=True, exist_ok=True)
