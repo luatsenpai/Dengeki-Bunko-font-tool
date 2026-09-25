@@ -419,6 +419,15 @@ def looks_binary(raw: bytes):
 
 
 def decode_text(raw: bytes, ext: str):
+    """Decode text-like files, with explicit CSV/TSV handling.
+
+    CSV exported by Excel is commonly UTF-8 BOM or UTF-16LE.  Some UTF-16 CSVs
+    have no BOM, so detect their NUL-byte pattern before generic binary checks.
+    Vietnamese legacy CSV may also be CP1258; accept that as a final fallback.
+    """
+    ext = ext.lower()
+    is_table = ext in {".csv", ".tsv"}
+
     if raw.startswith(codecs.BOM_UTF8):
         return raw[3:].decode("utf-8"), "utf-8-sig"
     if raw.startswith(codecs.BOM_UTF16_LE):
@@ -430,6 +439,22 @@ def decode_text(raw: bytes, ext: str):
     if raw.startswith(codecs.BOM_UTF32_BE):
         return raw[4:].decode("utf-32-be"), "utf-32-be"
 
+    # Excel/LibreOffice CSV/TSV can be UTF-16 without a BOM.  Detect the
+    # alternating NUL pattern before looks_binary() rejects it.
+    if is_table and raw:
+        probe = raw[:4096]
+        even_nuls = sum(1 for i in range(0, len(probe), 2) if probe[i] == 0)
+        odd_nuls = sum(1 for i in range(1, len(probe), 2) if probe[i] == 0)
+        even_slots = max(1, (len(probe) + 1) // 2)
+        odd_slots = max(1, len(probe) // 2)
+        try:
+            if odd_nuls / odd_slots > 0.25 and even_nuls / even_slots < 0.10:
+                return raw.decode("utf-16-le"), "utf-16-le(no-bom)"
+            if even_nuls / even_slots > 0.25 and odd_nuls / odd_slots < 0.10:
+                return raw.decode("utf-16-be"), "utf-16-be(no-bom)"
+        except UnicodeDecodeError:
+            pass
+
     if looks_binary(raw):
         return None
 
@@ -440,7 +465,7 @@ def decode_text(raw: bytes, ext: str):
 
     try:
         txt = raw.decode("cp932")
-        if ext.lower() not in TEXT_EXTS:
+        if ext not in TEXT_EXTS:
             probe = txt[:8192]
             if probe:
                 bad = sum(1 for c in probe if ord(c) < 32 and c not in "\t\r\n\f")
@@ -448,7 +473,16 @@ def decode_text(raw: bytes, ext: str):
                     return None
         return txt, "cp932"
     except UnicodeDecodeError:
-        return None
+        pass
+
+    # Legacy Vietnamese spreadsheet export fallback.
+    if is_table:
+        try:
+            return raw.decode("cp1258"), "cp1258"
+        except UnicodeDecodeError:
+            pass
+
+    return None
 
 
 class FixedTextEncodeError(Exception):
@@ -1124,13 +1158,21 @@ class ReplaceToolTab(ttk.Frame):
         box = ttk.LabelFrame(self, text="Input", padding=10)
         box.pack(fill="x")
         add_path_row(box, 0, "Font folder:", self.font_var, self.pick_font_folder)
-        add_path_row(box, 1, "Thư mục text:", self.folder_var, self.pick_text_folder)
+
+        ttk.Label(box, text="Text / CSV:", width=18).grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(box, textvariable=self.folder_var).grid(row=1, column=1, sticky="ew", padx=6)
+        pick = ttk.Frame(box)
+        pick.grid(row=1, column=2, sticky="e")
+        ttk.Button(pick, text="Thư mục…", command=self.pick_text_folder).pack(side="left")
+        ttk.Button(pick, text="File…", command=self.pick_text_file).pack(side="left", padx=(4, 0))
+        box.grid_columnconfigure(1, weight=1)
 
         ttk.Label(
             self,
             text=(
                 f"Built-in map: {FIXED_COUNT} ký tự. Replace Tool KHÔNG dùng vi_mapping.json và KHÔNG giả định F040. "
                 f"Nó đọc code thật tại FNT #{FIXED_START_INDEX}..#{FIXED_END_INDEX}, rồi ghi đúng raw byte của từng code. "
+                "Nhận TXT/CSV/TSV và các file text phổ biến; có thể chọn cả thư mục hoặc một file. "
                 "File có thay đổi được xuất CP932."
             ),
             wraplength=1000,
@@ -1157,7 +1199,19 @@ class ReplaceToolTab(ttk.Frame):
             self.font_var.set(p)
 
     def pick_text_folder(self):
-        p = filedialog.askdirectory(title="Chọn thư mục text")
+        p = filedialog.askdirectory(title="Chọn thư mục text / CSV")
+        if p:
+            self.folder_var.set(p)
+
+    def pick_text_file(self):
+        p = filedialog.askopenfilename(
+            title="Chọn file text / CSV",
+            filetypes=[
+                ("CSV / TSV", "*.csv *.tsv"),
+                ("Text", "*.txt *.csv *.tsv *.ini *.cfg *.json *.xml *.yml *.yaml *.lua *.ks *.scr *.script *.msg *.mes *.dat *.lst *.tbl *.po *.srt *.ass *.sub"),
+                ("All files", "*.*"),
+            ],
+        )
         if p:
             self.folder_var.set(p)
 
@@ -1205,18 +1259,27 @@ class ReplaceToolTab(ttk.Frame):
     def run(self):
         try:
             src = Path(self.folder_var.get()).resolve()
-            if not src.is_dir():
-                raise ValueError("Chưa chọn thư mục text hợp lệ.")
+            if not src.exists() or not (src.is_dir() or src.is_file()):
+                raise ValueError("Chưa chọn file hoặc thư mục text/CSV hợp lệ.")
             glyphs, char_to_bytes, rows = self.load_fixed_map()
 
-            dst = src.parent / (src.name + "_vi")
-            if dst.exists():
-                if not messagebox.askyesno(
-                    "Thư mục đã tồn tại",
-                    f"{dst.name} đã tồn tại.\n\nXóa và tạo lại?",
+            single_file = src.is_file()
+            if single_file:
+                dst = src.with_name(src.stem + "_vi" + src.suffix)
+                if dst.exists() and not messagebox.askyesno(
+                    "File đã tồn tại",
+                    f"{dst.name} đã tồn tại.\n\nGhi đè?",
                 ):
                     return
-                shutil.rmtree(dst)
+            else:
+                dst = src.parent / (src.name + "_vi")
+                if dst.exists():
+                    if not messagebox.askyesno(
+                        "Thư mục đã tồn tại",
+                        f"{dst.name} đã tồn tại.\n\nXóa và tạo lại?",
+                    ):
+                        return
+                    shutil.rmtree(dst)
 
             self.log.clear()
             self.log.write_line(f"Font   : {Path(self.font_var.get()).resolve()}")
@@ -1228,64 +1291,82 @@ class ReplaceToolTab(ttk.Frame):
             )
             self.log.write_line("")
 
-            dst.mkdir(parents=True)
+            if not single_file:
+                dst.mkdir(parents=True)
+
             files_total = 0
             files_changed = 0
             replacements = 0
             binaries = 0
 
-            for cur, dirs, files in os.walk(src):
-                curp = Path(cur)
-                rel = curp.relative_to(src)
-                outdir = dst / rel
-                outdir.mkdir(parents=True, exist_ok=True)
+            def process_one(inp: Path, out: Path, label: str):
+                nonlocal files_total, files_changed, replacements, binaries
+                files_total += 1
+                raw = inp.read_bytes()
+                dec = decode_text(raw, inp.suffix)
+                if dec is None:
+                    if single_file:
+                        raise ValueError(
+                            f"Không nhận diện được {inp.name} là text/CSV hỗ trợ. "
+                            "Hỗ trợ CSV UTF-8, UTF-8 BOM, UTF-16 LE/BE, CP932 và CP1258."
+                        )
+                    shutil.copy2(inp, out)
+                    binaries += 1
+                    self.log.write_line(f"COPY      {label}")
+                    return
 
-                for name in files:
-                    files_total += 1
-                    inp = curp / name
-                    out = outdir / name
-                    raw = inp.read_bytes()
-                    dec = decode_text(raw, inp.suffix)
-                    if dec is None:
+                text, enc = dec
+                n_expected = sum(text.count(c) for c in VI_MAPPING_ORDER)
+                if n_expected == 0:
+                    if single_file:
+                        out.write_bytes(raw)
+                        try:
+                            shutil.copystat(inp, out)
+                        except Exception:
+                            pass
+                    else:
                         shutil.copy2(inp, out)
-                        binaries += 1
-                        self.log.write_line(f"COPY      {inp.relative_to(src)}")
-                        continue
+                    self.log.write_line(f"UNCHANGED {label}  [{enc}]")
+                    return
 
-                    text, enc = dec
-                    # Fast check first, so untouched files stay byte-for-byte identical.
-                    n_expected = sum(text.count(c) for c in VI_MAPPING_ORDER)
-                    if n_expected == 0:
-                        shutil.copy2(inp, out)
-                        self.log.write_line(f"UNCHANGED {inp.relative_to(src)}")
-                        continue
+                try:
+                    outbytes, n = encode_fixed_index_cp932(text, char_to_bytes)
+                except FixedTextEncodeError as e:
+                    raise RuntimeError(
+                        f"{label} còn ký tự không encode được CP932: {e.char!r} "
+                        f"(vị trí {e.position}).\n"
+                        "Ký tự Việt trong fixed map được xử lý trực tiếp bằng raw byte; lỗi này là ký tự khác ngoài CP932."
+                    ) from e
 
-                    try:
-                        outbytes, n = encode_fixed_index_cp932(text, char_to_bytes)
-                    except FixedTextEncodeError as e:
-                        raise RuntimeError(
-                            f"{inp.relative_to(src)} còn ký tự không encode được CP932: {e.char!r} "
-                            f"(vị trí {e.position}).\n"
-                            "Ký tự Việt trong fixed map được xử lý trực tiếp bằng raw byte; lỗi này là ký tự khác ngoài CP932."
-                        ) from e
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(outbytes)
+                try:
+                    shutil.copystat(inp, out)
+                except Exception:
+                    pass
+                files_changed += 1
+                replacements += n
+                self.log.write_line(f"REPLACE   {label}  [{enc} -> CP932 fixed-index]  {n}")
 
-                    out.write_bytes(outbytes)
-                    try:
-                        shutil.copystat(inp, out)
-                    except Exception:
-                        pass
-                    files_changed += 1
-                    replacements += n
-                    self.log.write_line(
-                        f"REPLACE   {inp.relative_to(src)}  [{enc} -> CP932 fixed-index]  {n}"
-                    )
+            if single_file:
+                process_one(src, dst, src.name)
+            else:
+                for cur, dirs, files in os.walk(src):
+                    curp = Path(cur)
+                    rel = curp.relative_to(src)
+                    outdir = dst / rel
+                    outdir.mkdir(parents=True, exist_ok=True)
+                    for name in files:
+                        inp = curp / name
+                        out = outdir / name
+                        process_one(inp, out, str(inp.relative_to(src)))
 
             self.status_var.set(
                 f"Hoàn tất — {replacements} ký tự / {files_changed} file. Output: {dst.name}"
             )
             self.log.write_line("")
             self.log.write_line(f"Hoàn tất: {replacements} ký tự trong {files_changed}/{files_total} file.")
-            self.log.write_line(f"Binary/không xác định: {binaries} (copy nguyên).")
+            self.log.write_line(f"Binary/không xác định: {binaries}" + ("." if single_file else " (copy nguyên)."))
             self.log.write_line(f"Output: {dst}")
             messagebox.showinfo(
                 "Hoàn tất",
