@@ -35,6 +35,8 @@ import shutil
 import struct
 import sys
 import traceback
+import statistics
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
@@ -49,7 +51,7 @@ except ImportError:
 # Shared fixed-index mapping
 # -----------------------------------------------------------------------------
 
-APP_TITLE = "DFCI AIO - Fixed Index"
+APP_TITLE = "DFCI AIO - Fixed Index v6"
 FNT_HEADER_SIZE = 0x3E
 GLYPH_RECORD_SIZE = 0x16
 GXT_HEADER_SIZE = 0x40
@@ -313,57 +315,137 @@ def find_space(occ, w: int, h: int, padding: int):
     return None
 
 
+DOT_BELOW_CHARS = set("ạậặẹệịọộợụựỵẠẬẶẸỆỊỌỘỢỤỰỴ")
+
+
+def base_latin_char(char: str) -> str:
+    """Return the unaccented Latin base used to match stock FNT metrics."""
+    if char == "đ":
+        return "d"
+    if char == "Đ":
+        return "D"
+    decomp = unicodedata.normalize("NFD", char)
+    for c in decomp:
+        if "A" <= c <= "Z" or "a" <= c <= "z":
+            return c
+    return char
+
+
+def stock_ascii_metrics(glyphs: list[Glyph]) -> dict[str, Glyph]:
+    out = {}
+    for g in glyphs:
+        c = decode_fnt_code(g.code)
+        if c and len(c) == 1 and ord(c) < 128 and c not in out:
+            out[c] = g
+    return out
+
+
+def auto_fit_font_metrics(font_path: Path, glyphs: list[Glyph], min_size: int = 8, max_size: int = 40):
+    """Estimate TTF size/baseline from the game's stock ASCII metrics.
+
+    The old builder fitted every accented glyph into 11x22 as a whole.  That can
+    shrink the letter body merely because an accent/dot extends the bbox.  Here
+    we first match the TTF's *unaccented* A-Z/a-z body to the stock FNT and only
+    then render Vietnamese at that same scale.
+    """
+    refs = stock_ascii_metrics(glyphs)
+    sample = [c for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789" if c in refs]
+    if not sample:
+        raise ValueError("Không tìm thấy ASCII metrics trong Font00.fnt để Auto-fit.")
+
+    probe = Image.new("L", (192, 192), 0)
+    draw = ImageDraw.Draw(probe)
+    best = None
+    for size in range(min_size, max_size + 1):
+        font = ImageFont.truetype(str(font_path), size)
+        errs = []
+        for c in sample:
+            bbox = draw.textbbox((0, 0), c, font=font, anchor="ls")
+            if not bbox:
+                continue
+            l, t, r, b = bbox
+            rw, rh = max(1, r-l), max(1, b-t)
+            ref = refs[c]
+            # Height is more important than width for matching the original body.
+            errs.append(abs(rh-ref.height) + 0.35*abs(rw-ref.width))
+        if not errs:
+            continue
+        score = statistics.median(errs)
+        if best is None or score < best[0]:
+            best = (score, size)
+    if best is None:
+        raise ValueError("Không Auto-fit được TTF/OTF này.")
+
+    _, size = best
+    font = ImageFont.truetype(str(font_path), size)
+    baseline_candidates = []
+    for c in sample:
+        bbox = draw.textbbox((0, 0), c, font=font, anchor="ls")
+        if not bbox:
+            continue
+        _, t, _, _ = bbox
+        ref = refs[c]
+        stock_top = -ref.neg_top
+        baseline_candidates.append(stock_top - t)
+
+    baseline = int(round(statistics.median(baseline_candidates))) if baseline_candidates else 19
+    # Stock Latin occupies a 22px-high cell in this font format.
+    cell_height = max(22, max((-refs[c].neg_top + refs[c].height) for c in sample))
+    advance = int(round(statistics.median([refs[c].advance for c in sample])))
+    return size, baseline, cell_height, advance, best[0]
+
+
 def render_glyph(font_path: Path, char: str, font_size: int, baseline: int,
                  cell_height: int, advance: int):
+    """Render at the chosen body scale; do not shrink just because of accents.
+
+    Width is compressed only when it exceeds the stock advance. Vertical scaling
+    is a last resort only when the full glyph truly cannot fit in the cell.
+    """
     font = ImageFont.truetype(str(font_path), font_size)
-    probe = Image.new("L", (128, 128), 0)
+    probe = Image.new("L", (192, 192), 0)
     draw = ImageDraw.Draw(probe)
     bbox = draw.textbbox((0, 0), char, font=font, anchor="ls")
     if bbox is None:
         raise ValueError(f"TTF không có glyph cho {char!r}.")
     l, t, r, b = bbox
-    w0, h0 = max(1, r - l), max(1, b - t)
+    w0, h0 = max(1, r-l), max(1, b-t)
 
     img = Image.new("L", (w0, h0), 0)
     d = ImageDraw.Draw(img)
     d.text((-l, -t), char, font=font, fill=255, anchor="ls")
     baseline_in_crop = -t
 
-    max_w = max(1, advance)
-    max_h = max(1, cell_height)
-    scale = min(1.0, max_w / img.width, max_h / img.height)
-    if scale < 1.0:
-        nw = max(1, round(img.width * scale))
-        nh = max(1, round(img.height * scale))
-        baseline_in_crop = round(baseline_in_crop * scale)
-        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
-
     bb = img.getbbox()
     if bb:
-        _, top_trim, _, _ = bb
+        left_trim, top_trim, _, _ = bb
         img = img.crop(bb)
         baseline_in_crop -= top_trim
 
     w, h = img.size
+
+    # Preserve vertical size.  If the horn/accent makes the glyph a little wider,
+    # compress only X instead of shrinking the whole character.
+    if w > advance:
+        img = img.resize((max(1, advance), h), Image.Resampling.LANCZOS)
+        w, h = img.size
+
+    # Only full-scale down if the accent + body physically exceeds the cell.
+    if h > cell_height:
+        ratio = cell_height / h
+        nw = max(1, min(advance, round(w * ratio)))
+        img = img.resize((nw, cell_height), Image.Resampling.LANCZOS)
+        baseline_in_crop = round(baseline_in_crop * ratio)
+        w, h = img.size
+
     top = baseline - baseline_in_crop
     if top < 0:
         top = 0
     if top + h > cell_height:
+        # Shift upward instead of shrinking. Important for dot-below letters.
         top = max(0, cell_height - h)
-    if h > cell_height:
-        nh = cell_height
-        nw = max(1, round(w * nh / h))
-        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
-        w, h = img.size
-        top = 0
-    if w > advance:
-        nw = advance
-        nh = max(1, round(h * nw / w))
-        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
-        w, h = img.size
-        top = min(max(0, top), cell_height - h)
-    return img, top
 
+    return img, top
 
 def paint_glyph(linear: bytearray, alpha_img: Image.Image, x: int, y: int):
     pix = alpha_img.tobytes()
@@ -398,6 +480,30 @@ def paint_alpha(linear: bytearray, g: Glyph, img: Image.Image):
         for x in range(g.width):
             off = ((g.atlas_y + y) * PAGE_W + (g.atlas_x + x)) * 4
             linear[off:off + 4] = bytes((255, 255, 255, pix[x, y]))
+
+
+def clear_glyph_rect(linear: bytearray, g: Glyph):
+    if not (0 <= g.page < PAGE_COUNT) or g.width <= 0 or g.height <= 0:
+        return
+    for y in range(g.height):
+        for x in range(g.width):
+            px = g.atlas_x + x
+            py = g.atlas_y + y
+            if 0 <= px < PAGE_W and 0 <= py < PAGE_H:
+                off = (py * PAGE_W + px) * 4
+                linear[off:off + 4] = bytes((255, 255, 255, 0))
+
+
+def image_to_glyph_alpha(img: Image.Image) -> Image.Image:
+    """Convert an imported PNG to the atlas alpha bitmap without flattening transparency."""
+    if img.mode == "L":
+        return img.copy()
+    if "A" in img.getbands():
+        alpha = img.getchannel("A")
+        lo, hi = alpha.getextrema()
+        if lo != 255 or hi != 255:
+            return alpha
+    return img.convert("L")
 
 
 # Text helpers -----------------------------------------------------------------
@@ -555,6 +661,7 @@ class FontToolTab(ttk.Frame):
         self.cellh_var = tk.IntVar(value=22)
         self.advance_var = tk.IntVar(value=11)
         self.padding_var = tk.IntVar(value=1)
+        self.auto_fit_var = tk.BooleanVar(value=True)
         self.build_ui()
 
     def build_ui(self):
@@ -576,6 +683,12 @@ class FontToolTab(ttk.Frame):
         for col, (name, var) in enumerate(fields):
             ttk.Label(opts, text=name + ":").grid(row=0, column=col * 2, sticky="e", padx=(6, 2), pady=4)
             ttk.Spinbox(opts, from_=0, to=64, textvariable=var, width=6).grid(row=0, column=col * 2 + 1, sticky="w", padx=(0, 10))
+        ttk.Checkbutton(
+            opts, text="Auto-fit size/baseline theo Latin gốc", variable=self.auto_fit_var
+        ).grid(row=1, column=0, columnspan=5, sticky="w", padx=6, pady=(4, 0))
+        ttk.Button(opts, text="Đo size gốc ngay", command=self.measure_original_metrics).grid(
+            row=1, column=5, columnspan=3, sticky="w", padx=6, pady=(4, 0)
+        )
 
         mapbox = ttk.LabelFrame(self, text="Built-in fixed-index map", padding=10)
         mapbox.pack(fill="x", pady=(10, 0))
@@ -649,6 +762,21 @@ class FontToolTab(ttk.Frame):
             raise ValueError("Chưa chọn TTF/OTF.")
         return src, ttf
 
+    def measure_original_metrics(self):
+        try:
+            src, ttf = self.validate_inputs(need_ttf=True)
+            _, glyphs, _ = load_fnt(src / "Font00.fnt")
+            size, baseline, cell_h, advance, score = auto_fit_font_metrics(ttf, glyphs)
+            self.size_var.set(size)
+            self.baseline_var.set(baseline)
+            self.cellh_var.set(cell_h)
+            self.advance_var.set(advance)
+            self.log.write_line(
+                f"Auto-fit: TTF size={size}, baseline={baseline}, cell={cell_h}, advance={advance}, score={score:.2f}"
+            )
+        except Exception as e:
+            messagebox.showerror("Auto-fit", str(e))
+
     def analyze(self):
         try:
             self.log.clear()
@@ -707,6 +835,18 @@ class FontToolTab(ttk.Frame):
             validate_fixed_indices(glyphs)
             _, before_rows = fixed_index_byte_map(glyphs)  # also validates unique codes
 
+            if self.auto_fit_var.get():
+                font_size, baseline, cell_h, advance, fit_score = auto_fit_font_metrics(ttf, glyphs)
+                self.size_var.set(font_size)
+                self.baseline_var.set(baseline)
+                self.cellh_var.set(cell_h)
+                self.advance_var.set(advance)
+                self.log.write_line(
+                    f"Auto-fit Latin gốc: size={font_size}, baseline={baseline}, cell={cell_h}, advance={advance}, score={fit_score:.2f}"
+                )
+
+            ascii_metrics = stock_ascii_metrics(glyphs)
+
             self.log.write_line(
                 f"Fixed-index mode: FNT #{FIXED_START_INDEX}..#{FIXED_END_INDEX}; "
                 "code của record được giữ nguyên."
@@ -725,7 +865,10 @@ class FontToolTab(ttk.Frame):
                 old = glyphs[fnt_idx]
                 preserved_code = old.code
 
-                alpha, top = render_glyph(ttf, char, font_size, baseline, cell_h, advance)
+                base = base_latin_char(char)
+                ref = ascii_metrics.get(base)
+                char_advance = ref.advance if ref is not None and ref.advance > 0 else advance
+                alpha, top = render_glyph(ttf, char, font_size, baseline, cell_h, char_advance)
                 w, h = alpha.size
                 pos = find_space(occ, w, h, padding)
                 if pos is None:
@@ -737,14 +880,14 @@ class FontToolTab(ttk.Frame):
                 paint_glyph(pages[page][1], alpha, ax, ay)
                 dirty_pages.add(page)
 
-                left = max(0, (advance - w) // 2)
+                left = max(0, (char_advance - w) // 2)
                 glyphs[fnt_idx] = Glyph(
                     code=preserved_code,
                     page=page,
                     center_x=left + (w // 2),
                     neg_half_width=-(w // 2),
                     neg_top=-top,
-                    advance=advance,
+                    advance=char_advance,
                     width=w,
                     height=h,
                     atlas_x=ax,
@@ -754,7 +897,7 @@ class FontToolTab(ttk.Frame):
                 self.log.write_line(
                     f"[{order:03d}/{FIXED_COUNT}] FNT #{fnt_idx:04d}  {char}  "
                     f"code=0x{preserved_code:04X} [{raw.hex(' ').upper()}]  "
-                    f"page {page:02d} ({ax},{ay}) {w}x{h}"
+                    f"page {page:02d} ({ax},{ay}) {w}x{h} adv={char_advance} top={top}"
                 )
 
             out.mkdir(parents=True, exist_ok=True)
@@ -818,6 +961,19 @@ class FontEditorTab(ttk.Frame):
         self.pages = {}
         self.selected_index = None
         self.preview_tk = None
+        self.glyph_clipboard = None
+
+        # Every field stored in one FNT glyph record is editable from the UI.
+        self.code_edit = tk.StringVar(value="0x0000")
+        self.page_edit = tk.IntVar(value=0)
+        self.x_edit = tk.IntVar(value=0)
+        self.y_edit = tk.IntVar(value=0)
+        self.width_edit = tk.IntVar(value=1)
+        self.height_edit = tk.IntVar(value=1)
+        self.advance_edit = tk.IntVar(value=11)
+        self.centerx_edit = tk.IntVar(value=0)
+        self.neghalf_edit = tk.IntVar(value=0)
+        self.negtop_edit = tk.IntVar(value=0)
         self.build_ui()
 
     def build_ui(self):
@@ -833,7 +989,10 @@ class FontEditorTab(ttk.Frame):
         ttk.Button(act, text="Export Font", command=self.export_font).pack(side="left")
         ttk.Button(act, text="Import Font", command=self.import_font).pack(side="left", padx=6)
         ttk.Button(act, text="Save current edits…", command=self.save_current).pack(side="left")
-        ttk.Button(act, text="Export glyph", command=self.export_selected).pack(side="left", padx=6)
+        ttk.Button(act, text="Export glyph", command=self.export_selected).pack(side="left", padx=(6, 0))
+        ttk.Button(act, text="Import glyph", command=self.import_selected).pack(side="left", padx=(6, 0))
+        ttk.Button(act, text="Copy glyph", command=self.copy_glyph).pack(side="left", padx=(6, 0))
+        ttk.Button(act, text="Paste glyph", command=self.paste_glyph).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(
             act, text="Hiện tiếng Việt theo fixed index", variable=self.show_vi_var,
             command=self.refresh_tree,
@@ -850,13 +1009,14 @@ class FontEditorTab(ttk.Frame):
         main.add(left, weight=3)
         main.add(right, weight=2)
 
-        cols = ("order", "idx", "display", "code", "page", "xy", "size", "adv")
+        cols = ("order", "idx", "display", "code", "page", "xy", "width", "height", "adv")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
         headings = {
             "order": "Thứ tự", "idx": "FNT #", "display": "Ký tự", "code": "Code",
-            "page": "Page", "xy": "X,Y", "size": "W×H", "adv": "Advance",
+            "page": "Page", "xy": "X,Y", "width": "Width", "height": "Height", "adv": "Advance",
         }
-        widths = {"order": 70, "idx": 60, "display": 90, "code": 90, "page": 55, "xy": 95, "size": 75, "adv": 70}
+        widths = {"order": 65, "idx": 58, "display": 78, "code": 82, "page": 48, "xy": 82,
+                  "width": 58, "height": 58, "adv": 65}
         for c in cols:
             self.tree.heading(c, text=headings[c])
             self.tree.column(c, width=widths[c], anchor="center")
@@ -865,11 +1025,51 @@ class FontEditorTab(ttk.Frame):
         self.tree.pack(side="left", fill="both", expand=True)
         ys.pack(side="right", fill="y")
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.tree.bind("<Control-c>", lambda e: self.copy_glyph())
+        self.tree.bind("<Control-v>", lambda e: self.paste_glyph())
 
-        info = ttk.LabelFrame(right, text="Glyph", padding=10)
-        info.pack(fill="x")
-        self.info_text = tk.StringVar(value="Chưa chọn glyph.")
-        ttk.Label(info, textvariable=self.info_text, justify="left").pack(anchor="w")
+        # Compact editor: remove the old multi-line info block. All record data is
+        # already visible/editable in the fields below and in the table columns.
+        metrics = ttk.LabelFrame(right, text="Edit FNT record", padding=10)
+        metrics.pack(fill="x")
+
+        fields = [
+            ("Code", self.code_edit, "entry"),
+            ("Page", self.page_edit, "spin_page"),
+            ("X", self.x_edit, "spin_xy"),
+            ("Y", self.y_edit, "spin_xy"),
+            ("Width", self.width_edit, "spin_size"),
+            ("Height", self.height_edit, "spin_size"),
+            ("Advance", self.advance_edit, "spin_u16"),
+            ("Center X", self.centerx_edit, "spin_s16"),
+            ("Neg Half W", self.neghalf_edit, "spin_s16"),
+            ("Neg Top", self.negtop_edit, "spin_s16"),
+        ]
+        for i, (label, var, kind) in enumerate(fields):
+            row = i // 2
+            col = (i % 2) * 2
+            ttk.Label(metrics, text=label + ":").grid(row=row, column=col, sticky="e", padx=(4, 3), pady=2)
+            if kind == "entry":
+                w = ttk.Entry(metrics, textvariable=var, width=10)
+            elif kind == "spin_page":
+                w = ttk.Spinbox(metrics, from_=0, to=PAGE_COUNT-1, textvariable=var, width=8)
+            elif kind == "spin_xy":
+                w = ttk.Spinbox(metrics, from_=0, to=511, textvariable=var, width=8)
+            elif kind == "spin_size":
+                w = ttk.Spinbox(metrics, from_=1, to=512, textvariable=var, width=8)
+            elif kind == "spin_u16":
+                w = ttk.Spinbox(metrics, from_=0, to=65535, textvariable=var, width=8)
+            else:
+                w = ttk.Spinbox(metrics, from_=-32768, to=32767, textvariable=var, width=8)
+            w.grid(row=row, column=col+1, sticky="w", padx=(0, 8), pady=2)
+
+        edit_buttons = ttk.Frame(metrics)
+        edit_buttons.grid(row=5, column=0, columnspan=4, sticky="w", pady=(7, 0))
+        ttk.Button(edit_buttons, text="Apply ALL fields", command=self.apply_metrics).pack(side="left")
+        ttk.Label(
+            metrics,
+            text="Advance = khoảng chạy ngang; vị trí lên/xuống do Neg Top + Height/bitmap.",
+        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         prev = ttk.LabelFrame(right, text="Preview", padding=10)
         prev.pack(fill="both", expand=True, pady=(10, 0))
@@ -944,7 +1144,7 @@ class FontEditorTab(ttk.Frame):
                 continue
             self.tree.insert(
                 "", "end", iid=str(idx),
-                values=(idx + 1, idx, disp, code, g.page, f"{g.atlas_x},{g.atlas_y}", f"{g.width}×{g.height}", g.advance),
+                values=(idx + 1, idx, disp, code, g.page, f"{g.atlas_x},{g.atlas_y}", g.width, g.height, g.advance),
             )
 
     def on_select(self, event=None):
@@ -954,24 +1154,16 @@ class FontEditorTab(ttk.Frame):
         idx = int(sel[0])
         self.selected_index = idx
         g = self.glyphs[idx]
-        disp = self.display_char(idx, g)
-        vi = VI_INDEX_TO_CHAR.get(idx)
-        cp = decode_fnt_code(g.code)
-        raw = None
-        try:
-            raw = code_to_raw_bytes(g.code).hex(" ").upper()
-        except Exception:
-            raw = "-"
-        map_pos = idx - FIXED_START_INDEX + 1 if vi else None
-        map_text = f"{map_pos}/{FIXED_COUNT}" if map_pos else "-"
-        self.info_text.set(
-            f"Index FNT: {idx}\nThứ tự mapping: {map_text}\nHiển thị: {disp}\n"
-            f"FNT code: 0x{g.code:04X}\nRaw bytes: {raw}\nCP932 gốc: {cp!r}\n"
-            f"Fixed map Việt: {repr(vi) if vi else '-'}\n"
-            f"Page: {g.page}\nAtlas: X={g.atlas_x}, Y={g.atlas_y}\n"
-            f"Size: {g.width}×{g.height}\nAdvance: {g.advance}\n"
-            f"centerX: {g.center_x}\nnegHalfWidth: {g.neg_half_width}\nnegTop: {g.neg_top}"
-        )
+        self.code_edit.set(f"0x{g.code:04X}")
+        self.page_edit.set(g.page)
+        self.x_edit.set(g.atlas_x)
+        self.y_edit.set(g.atlas_y)
+        self.width_edit.set(g.width)
+        self.height_edit.set(g.height)
+        self.advance_edit.set(g.advance)
+        self.centerx_edit.set(g.center_x)
+        self.neghalf_edit.set(g.neg_half_width)
+        self.negtop_edit.set(g.neg_top)
         if 0 <= g.page < PAGE_COUNT and g.width > 0 and g.height > 0:
             img = glyph_alpha_from_page(self.pages[g.page][1], g)
             scale = max(1, min(10, 220 // max(1, max(img.size))))
@@ -981,6 +1173,164 @@ class FontEditorTab(ttk.Frame):
         else:
             self.preview.configure(image="")
             self.preview_tk = None
+
+    def apply_metrics(self):
+        """Apply every editable FNT field and safely move/resize the atlas bitmap."""
+        try:
+            if self.selected_index is None:
+                raise ValueError("Chưa chọn glyph.")
+            idx = self.selected_index
+            old = self.glyphs[idx]
+
+            code_text = self.code_edit.get().strip()
+            try:
+                code = int(code_text, 0)
+            except Exception:
+                code = int(code_text, 16)
+            page = int(self.page_edit.get())
+            ax = int(self.x_edit.get())
+            ay = int(self.y_edit.get())
+            width = int(self.width_edit.get())
+            height = int(self.height_edit.get())
+            advance = int(self.advance_edit.get())
+            center_x = int(self.centerx_edit.get())
+            neg_half = int(self.neghalf_edit.get())
+            neg_top = int(self.negtop_edit.get())
+
+            if not (1 <= code <= 0xFFFF):
+                raise ValueError("Code phải nằm trong 0x0001..0xFFFF.")
+            if not (0 <= page < PAGE_COUNT):
+                raise ValueError(f"Page phải nằm trong 0..{PAGE_COUNT-1}.")
+            if width <= 0 or height <= 0:
+                raise ValueError("Width/Height phải > 0.")
+            if not (0 <= ax < PAGE_W and 0 <= ay < PAGE_H):
+                raise ValueError("X/Y phải nằm trong atlas 512x512.")
+            if ax + width > PAGE_W or ay + height > PAGE_H:
+                raise ValueError("X/Y + Width/Height vượt khỏi atlas 512x512.")
+            if not (0 <= advance <= 0xFFFF):
+                raise ValueError("Advance phải nằm trong 0..65535.")
+            for name, value in (("Center X", center_x), ("Neg Half W", neg_half), ("Neg Top", neg_top)):
+                if not (-32768 <= value <= 32767):
+                    raise ValueError(f"{name} vượt phạm vi signed 16-bit.")
+
+            # Fixed block may change code, but raw bytes must stay unique so Replace Tool remains deterministic.
+            if idx in VI_INDEX_TO_CHAR:
+                for other_idx in range(FIXED_START_INDEX, FIXED_END_INDEX + 1):
+                    if other_idx != idx and self.glyphs[other_idx].code == code:
+                        raise ValueError(
+                            f"Code 0x{code:04X} đã được FNT #{other_idx} dùng trong fixed map; "
+                            "Replace Tool sẽ bị trùng raw byte."
+                        )
+
+            geometry_changed = (
+                page != old.page or ax != old.atlas_x or ay != old.atlas_y or
+                width != old.width or height != old.height
+            )
+
+            if geometry_changed:
+                if not (0 <= old.page < PAGE_COUNT and old.width > 0 and old.height > 0):
+                    raise ValueError("Glyph cũ không có bitmap hợp lệ để move/resize.")
+                img = glyph_alpha_from_page(self.pages[old.page][1], old)
+                if img.size != (width, height):
+                    img = img.resize((width, height), Image.Resampling.LANCZOS)
+
+                occ = build_occupancy(self.glyphs, 0, exclude_indices={idx})
+                if not rect_is_free(occ[page], ax, ay, width, height, 0):
+                    raise ValueError(
+                        "Vùng Page/X/Y/Width/Height mới đang đè lên glyph khác. "
+                        "Hãy đổi tọa độ hoặc kích thước."
+                    )
+                clear_glyph_rect(self.pages[old.page][1], old)
+                paint_glyph(self.pages[page][1], img, ax, ay)
+
+            self.glyphs[idx] = Glyph(
+                code=code,
+                page=page,
+                center_x=center_x,
+                neg_half_width=neg_half,
+                neg_top=neg_top,
+                advance=advance,
+                width=width,
+                height=height,
+                atlas_x=ax,
+                atlas_y=ay,
+            )
+
+            self.refresh_tree()
+            iid = str(idx)
+            if self.tree.exists(iid):
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+                self.tree.see(iid)
+            self.on_select()
+            self.status_var.set(f"Đã cập nhật toàn bộ FNT fields #{idx}. Chưa ghi file.")
+        except Exception as e:
+            messagebox.showerror("Apply ALL fields", str(e))
+
+    def copy_glyph(self):
+        try:
+            if self.selected_index is None:
+                raise ValueError("Chưa chọn glyph.")
+            g = self.glyphs[self.selected_index]
+            img = glyph_alpha_from_page(self.pages[g.page][1], g).copy()
+            self.glyph_clipboard = {
+                "image": img,
+                "advance": g.advance,
+                "center_x": g.center_x,
+                "neg_half_width": g.neg_half_width,
+                "neg_top": g.neg_top,
+                "source_index": self.selected_index,
+            }
+            self.status_var.set(f"Đã Copy glyph FNT #{self.selected_index} ({self.display_char(self.selected_index, g)}).")
+        except Exception as e:
+            messagebox.showerror("Copy glyph", str(e))
+
+    def paste_glyph(self):
+        try:
+            if self.selected_index is None:
+                raise ValueError("Chưa chọn glyph đích.")
+            if not self.glyph_clipboard:
+                raise ValueError("Clipboard glyph đang trống. Hãy Copy glyph trước.")
+            idx = self.selected_index
+            old = self.glyphs[idx]
+            clip = self.glyph_clipboard
+            img = clip["image"].copy()
+            w, h = img.size
+
+            # Free the destination record when searching. This allows reusing its
+            # old atlas rectangle if the copied glyph fits there.
+            occ = build_occupancy(self.glyphs, 1, exclude_indices={idx})
+            pos = find_space(occ, w, h, 1)
+            if pos is None:
+                raise RuntimeError(f"Không còn chỗ atlas cho glyph copy {w}x{h}.")
+            page, ax, ay = pos
+
+            clear_glyph_rect(self.pages[old.page][1], old)
+            paint_glyph(self.pages[page][1], img, ax, ay)
+            self.glyphs[idx] = Glyph(
+                code=old.code,                    # fixed-index/raw-byte contract preserved
+                page=page,
+                center_x=int(clip["center_x"]),
+                neg_half_width=int(clip["neg_half_width"]),
+                neg_top=int(clip["neg_top"]),
+                advance=int(clip["advance"]),
+                width=w,
+                height=h,
+                atlas_x=ax,
+                atlas_y=ay,
+            )
+            self.refresh_tree()
+            iid = str(idx)
+            if self.tree.exists(iid):
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+                self.tree.see(iid)
+            self.on_select()
+            self.status_var.set(
+                f"Đã Paste glyph từ FNT #{clip['source_index']} -> #{idx}. Code đích giữ nguyên. Chưa ghi file."
+            )
+        except Exception as e:
+            messagebox.showerror("Paste glyph", str(e))
 
     def export_selected(self):
         try:
@@ -1020,14 +1370,61 @@ class FontEditorTab(ttk.Frame):
         try:
             if self.selected_index is None:
                 raise ValueError("Chưa chọn glyph.")
-            p = filedialog.askopenfilename(title="Chọn PNG", filetypes=[("PNG", "*.png"), ("All files", "*.*")])
+            p = filedialog.askopenfilename(
+                title="Import glyph PNG",
+                filetypes=[("PNG", "*.png"), ("Image", "*.png *.bmp *.gif *.tif *.tiff"), ("All files", "*.*")],
+            )
             if not p:
                 return
-            g = self.glyphs[self.selected_index]
-            img = Image.open(p).convert("L")
-            paint_alpha(self.pages[g.page][1], g, img)
+
+            idx = self.selected_index
+            old = self.glyphs[idx]
+            img = image_to_glyph_alpha(Image.open(p))
+            w, h = img.size
+            if w <= 0 or h <= 0 or w > PAGE_W or h > PAGE_H:
+                raise ValueError(f"Kích thước ảnh {w}x{h} không hợp lệ cho atlas 512x512.")
+
+            # Prefer the current atlas position if the imported bitmap still fits there.
+            occ = build_occupancy(self.glyphs, 1, exclude_indices={idx})
+            pos = None
+            if (
+                0 <= old.page < PAGE_COUNT and
+                old.atlas_x + w <= PAGE_W and old.atlas_y + h <= PAGE_H and
+                rect_is_free(occ[old.page], old.atlas_x, old.atlas_y, w, h, 1)
+            ):
+                pos = (old.page, old.atlas_x, old.atlas_y)
+            if pos is None:
+                pos = find_space(occ, w, h, 1)
+            if pos is None:
+                raise RuntimeError(f"Không còn chỗ atlas cho PNG {w}x{h}.")
+            page, ax, ay = pos
+
+            clear_glyph_rect(self.pages[old.page][1], old)
+            paint_glyph(self.pages[page][1], img, ax, ay)
+
+            self.glyphs[idx] = Glyph(
+                code=old.code,
+                page=page,
+                center_x=old.center_x,
+                neg_half_width=-(w // 2),
+                neg_top=old.neg_top,
+                advance=old.advance,
+                width=w,
+                height=h,
+                atlas_x=ax,
+                atlas_y=ay,
+            )
+
+            self.refresh_tree()
+            iid = str(idx)
+            if self.tree.exists(iid):
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+                self.tree.see(iid)
             self.on_select()
-            self.status_var.set(f"Đã import PNG vào FNT #{self.selected_index}. Chưa ghi file.")
+            self.status_var.set(
+                f"Đã Import glyph PNG {w}x{h} vào FNT #{idx}; Width/Height cập nhật theo ảnh. Chưa ghi file."
+            )
         except Exception as e:
             messagebox.showerror("Import glyph", str(e))
 
