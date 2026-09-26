@@ -666,6 +666,76 @@ def decode_text(raw: bytes, ext: str):
     return None
 
 
+def decode_to_unicode_for_utf8_export(raw: bytes, ext: str):
+    """Decode a source text file for the CP932 -> UTF-8 staging workflow.
+
+    Preference is explicit Unicode BOM -> UTF-8 -> CP932 -> CP1258 (tables).
+    The function returns (text, source_encoding) or None for binary/unsupported
+    files. It intentionally does not reinterpret fixed-index game bytes back to
+    Vietnamese because those bytes are ambiguous with legitimate CP932 text.
+    """
+    ext = ext.lower()
+    is_table = ext in {".csv", ".tsv"}
+
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw[3:].decode("utf-8"), "utf-8-sig"
+    if raw.startswith(codecs.BOM_UTF16_LE):
+        return raw[2:].decode("utf-16-le"), "utf-16-le"
+    if raw.startswith(codecs.BOM_UTF16_BE):
+        return raw[2:].decode("utf-16-be"), "utf-16-be"
+    if raw.startswith(codecs.BOM_UTF32_LE):
+        return raw[4:].decode("utf-32-le"), "utf-32-le"
+    if raw.startswith(codecs.BOM_UTF32_BE):
+        return raw[4:].decode("utf-32-be"), "utf-32-be"
+
+    # UTF-16 without BOM is common in spreadsheet exports.
+    if is_table and raw:
+        probe = raw[:4096]
+        even_nuls = sum(1 for i in range(0, len(probe), 2) if probe[i] == 0)
+        odd_nuls = sum(1 for i in range(1, len(probe), 2) if probe[i] == 0)
+        even_slots = max(1, (len(probe) + 1) // 2)
+        odd_slots = max(1, len(probe) // 2)
+        try:
+            if odd_nuls / odd_slots > 0.25 and even_nuls / even_slots < 0.10:
+                return raw.decode("utf-16-le"), "utf-16-le(no-bom)"
+            if even_nuls / even_slots > 0.25 and odd_nuls / odd_slots < 0.10:
+                return raw.decode("utf-16-be"), "utf-16-be(no-bom)"
+        except UnicodeDecodeError:
+            pass
+
+    if looks_binary(raw):
+        return None
+
+    # Already UTF-8: keep it valid and normalize the staging folder to UTF-8.
+    try:
+        return raw.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+
+    # Original DFCI text is normally CP932. This is the key conversion path.
+    try:
+        return raw.decode("cp932"), "cp932"
+    except UnicodeDecodeError:
+        pass
+
+    if is_table:
+        try:
+            return raw.decode("cp1258"), "cp1258"
+        except UnicodeDecodeError:
+            pass
+
+    return None
+
+
+def encode_utf8_staging(text: str, ext: str) -> bytes:
+    """Write editable UTF-8; CSV/TSV get BOM so Excel opens Japanese correctly."""
+    text = unicodedata.normalize("NFC", text)
+    data = text.encode("utf-8")
+    if ext.lower() in {".csv", ".tsv"}:
+        return codecs.BOM_UTF8 + data
+    return data
+
+
 class FixedTextEncodeError(Exception):
     def __init__(self, char: str, position: int):
         self.char = char
@@ -1726,7 +1796,8 @@ class ReplaceToolTab(ttk.Frame):
                 f"Built-in map: {FIXED_COUNT} ký tự. Replace Tool KHÔNG dùng vi_mapping.json và KHÔNG giả định F040. "
                 f"Nó đọc code thật tại FNT #{FIXED_START_INDEX}..#{FIXED_END_INDEX}, rồi ghi đúng raw byte của từng code. "
                 "Nhận TXT/CSV/TSV và các file text phổ biến; có thể chọn cả thư mục hoặc một file. "
-                "Hỗ trợ cả CSV UTF-8 thuần và CSV mixed UTF-8 + CP932; file có thay đổi được ghi bằng raw byte fixed-index."
+                "Workflow an toàn: CP932 → folder UTF8 để dịch/sửa → Replace để encode ngược về game + fixed-index. "
+                "CSV/TSV trong folder UTF8 được ghi UTF-8 BOM để Excel giữ đúng tiếng Nhật."
             ),
             wraplength=1000,
         ).pack(anchor="w", pady=(10, 0))
@@ -1734,8 +1805,9 @@ class ReplaceToolTab(ttk.Frame):
         actions = ttk.Frame(self)
         actions.pack(fill="x", pady=(12, 8))
         ttk.Button(actions, text="Kiểm tra map theo Font00.fnt", command=self.analyze_map).pack(side="left")
-        ttk.Button(actions, text="TẠO BẢN _vi", command=self.run).pack(side="left", padx=8)
-        ttk.Button(actions, text="Dùng output Font Tool", command=self.use_builder_output).pack(side="left")
+        ttk.Button(actions, text="1. CP932 → UTF-8", command=self.convert_cp932_to_utf8).pack(side="left", padx=(8, 4))
+        ttk.Button(actions, text="2. UTF-8 → GAME + Replace", command=self.run).pack(side="left", padx=4)
+        ttk.Button(actions, text="Dùng output Font Tool", command=self.use_builder_output).pack(side="left", padx=(4, 0))
 
         ttk.Label(self, textvariable=self.status_var, wraplength=1000).pack(anchor="w")
         logframe = ttk.LabelFrame(self, text="Log", padding=8)
@@ -1772,6 +1844,121 @@ class ReplaceToolTab(ttk.Frame):
         p = self.aio.font_tab.out_var.get().strip()
         if p:
             self.font_var.set(p)
+
+    def convert_cp932_to_utf8(self):
+        """Create a sibling folder named UTF8 for safe translation/editing.
+
+        - Folder input: all relative paths are preserved under ../UTF8
+        - Single-file input: file is written to ../UTF8/<same name>
+        - Text files are decoded from CP932/known Unicode and written as UTF-8.
+        - CSV/TSV are UTF-8 BOM for Excel compatibility.
+        - Binary/unknown files are copied byte-for-byte.
+
+        After conversion the Text / CSV field automatically points to UTF8, so
+        the normal Replace button is the reverse leg of the workflow.
+        """
+        try:
+            src = Path(self.folder_var.get()).resolve()
+            if not src.exists() or not (src.is_dir() or src.is_file()):
+                raise ValueError("Chưa chọn file hoặc thư mục CP932 hợp lệ.")
+
+            # Always produce an explicit folder named UTF8 as requested.
+            dst_root = src.parent / "UTF8"
+            if src.is_dir() and src.name.lower() == "utf8":
+                raise ValueError("Nguồn đang là folder UTF8. Hãy chọn folder CP932 gốc để convert.")
+
+            if dst_root.exists():
+                if not messagebox.askyesno(
+                    "Folder UTF8 đã tồn tại",
+                    f"{dst_root}\n\nXóa và tạo lại?",
+                ):
+                    return
+                shutil.rmtree(dst_root)
+            dst_root.mkdir(parents=True, exist_ok=True)
+
+            self.log.clear()
+            self.log.write_line(f"CP932 source : {src}")
+            self.log.write_line(f"UTF8 output  : {dst_root}")
+            self.log.write_line("CSV/TSV output: UTF-8 BOM; text khác: UTF-8.")
+            self.log.write_line("")
+
+            files_total = 0
+            converted = 0
+            already_utf8 = 0
+            copied = 0
+            failed = 0
+
+            def convert_one(inp: Path, out: Path, label: str):
+                nonlocal files_total, converted, already_utf8, copied, failed
+                files_total += 1
+                raw = inp.read_bytes()
+                ext = inp.suffix.lower()
+
+                # Only treat known text extensions as text. Unknown/binary assets
+                # are preserved byte-for-byte instead of risking CP932 misdecode.
+                if ext not in TEXT_EXTS:
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(inp, out)
+                    copied += 1
+                    self.log.write_line(f"COPY      {label}  [non-text]")
+                    return
+
+                dec = decode_to_unicode_for_utf8_export(raw, ext)
+                if dec is None:
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(inp, out)
+                    copied += 1
+                    failed += 1
+                    self.log.write_line(f"COPY?     {label}  [không decode được; giữ nguyên]")
+                    return
+
+                text, enc = dec
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(encode_utf8_staging(text, ext))
+                try:
+                    shutil.copystat(inp, out)
+                except Exception:
+                    pass
+                converted += 1
+                if enc.startswith("utf-8"):
+                    already_utf8 += 1
+                self.log.write_line(f"CONVERT   {label}  [{enc} -> UTF-8{' BOM' if ext in {'.csv','.tsv'} else ''}]")
+
+            if src.is_file():
+                convert_one(src, dst_root / src.name, src.name)
+            else:
+                for cur, dirs, files in os.walk(src):
+                    curp = Path(cur)
+                    rel = curp.relative_to(src)
+                    outdir = dst_root / rel
+                    outdir.mkdir(parents=True, exist_ok=True)
+                    for name in files:
+                        inp = curp / name
+                        convert_one(inp, outdir / name, str(inp.relative_to(src)))
+
+            # Continue the workflow from the editable UTF8 folder.
+            self.folder_var.set(str(dst_root))
+            self.status_var.set(
+                f"Đã tạo UTF8 — {converted} text file; {copied} file copy nguyên. "
+                "Sửa/dịch trong folder UTF8 rồi bấm '2. UTF-8 → GAME + Replace'."
+            )
+            self.log.write_line("")
+            self.log.write_line(f"Hoàn tất: {converted}/{files_total} file text đã chuẩn hóa UTF-8.")
+            self.log.write_line(f"Đã là UTF-8 từ đầu: {already_utf8}")
+            self.log.write_line(f"Copy nguyên: {copied}; decode fail: {failed}")
+            self.log.write_line(f"Output: {dst_root}")
+            messagebox.showinfo(
+                "CP932 → UTF-8 hoàn tất",
+                f"Đã tạo folder:\n{dst_root}\n\n"
+                "Bây giờ sửa/dịch file trong folder UTF8. Khi xong, bấm:\n"
+                "2. UTF-8 → GAME + Replace",
+            )
+        except Exception as e:
+            self.status_var.set("Convert CP932 → UTF-8 lỗi.")
+            self.log.write_line("")
+            self.log.write_line("ERROR:")
+            self.log.write_line(traceback.format_exc())
+            messagebox.showerror("CP932 → UTF-8", str(e))
 
     def load_fixed_map(self):
         font_folder = Path(self.font_var.get())
@@ -1825,7 +2012,9 @@ class ReplaceToolTab(ttk.Frame):
                 ):
                     return
             else:
-                dst = src.parent / (src.name + "_vi")
+                # Round-trip workflow: ../UTF8 is the editable staging folder;
+                # its encoded game-ready output goes to sibling ../GAME.
+                dst = (src.parent / "GAME") if src.name.lower() == "utf8" else src.parent / (src.name + "_vi")
                 if dst.exists():
                     if not messagebox.askyesno(
                         "Thư mục đã tồn tại",
@@ -1836,8 +2025,8 @@ class ReplaceToolTab(ttk.Frame):
 
             self.log.clear()
             self.log.write_line(f"Font   : {Path(self.font_var.get()).resolve()}")
-            self.log.write_line(f"Text   : {src}")
-            self.log.write_line(f"Output : {dst}")
+            self.log.write_line(f"UTF8/Text source : {src}")
+            self.log.write_line(f"GAME output      : {dst}")
             self.log.write_line(
                 f"Map    : fixed FNT index #{FIXED_START_INDEX}..#{FIXED_END_INDEX}; "
                 "không dùng vi_mapping.json"
@@ -1956,7 +2145,7 @@ class ReplaceToolTab(ttk.Frame):
                         process_one(inp, out, str(inp.relative_to(src)))
 
             self.status_var.set(
-                f"Hoàn tất — {replacements} ký tự / {files_changed} file. Output: {dst.name}"
+                f"Hoàn tất — {replacements} ký tự / {files_changed} file. GAME output: {dst.name}"
             )
             self.log.write_line("")
             self.log.write_line(f"Hoàn tất: {replacements} ký tự trong {files_changed}/{files_total} file.")
@@ -2007,7 +2196,7 @@ class DFCIAIO(tk.Tk):
             self,
             text=(
                 f"Fixed-index master map: FNT #{FIXED_START_INDEX}=á … #{FIXED_END_INDEX}=Ỵ | "
-                "Không dùng vi_mapping.json | Replace lấy raw byte trực tiếp từ Font00.fnt"
+                "Không dùng vi_mapping.json | Workflow: CP932 → UTF8 → GAME + fixed-index replace"
             ),
             anchor="w",
         )
