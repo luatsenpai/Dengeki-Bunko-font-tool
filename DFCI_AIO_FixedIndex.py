@@ -52,7 +52,7 @@ except ImportError:
 # Shared fixed-index mapping
 # -----------------------------------------------------------------------------
 
-APP_TITLE = "DFCI AIO - Fixed Index v8"
+APP_TITLE = "DFCI AIO - Fixed Index v11"
 FNT_HEADER_SIZE = 0x3E
 GLYPH_RECORD_SIZE = 0x16
 GXT_HEADER_SIZE = 0x40
@@ -78,6 +78,51 @@ TEXT_EXTS = {
     ".yml", ".yaml", ".lua", ".ks", ".scr", ".script", ".msg", ".mes",
     ".dat", ".lst", ".tbl", ".po", ".srt", ".ass", ".sub"
 }
+CUSTOM_CHARSET_FILENAME = "dfci_fixed_index_chars.txt"
+
+
+def normalize_custom_chars(text: str) -> str:
+    text = unicodedata.normalize("NFC", text)
+    out = []
+    seen = set()
+    for ch in text:
+        if ch in "\r\n\t":
+            continue
+        if ch.isspace():
+            continue
+        if ch not in seen:
+            out.append(ch)
+            seen.add(ch)
+    return "".join(out)
+
+
+def fixed_end_for(chars: str) -> int:
+    return FIXED_START_INDEX + len(chars) - 1
+
+
+def index_maps_for(chars: str):
+    return (
+        {c: FIXED_START_INDEX + i for i, c in enumerate(chars)},
+        {FIXED_START_INDEX + i: c for i, c in enumerate(chars)},
+    )
+
+
+def load_custom_charset(folder: Path) -> str:
+    fn = folder / CUSTOM_CHARSET_FILENAME
+    if not fn.is_file():
+        return VI_MAPPING_ORDER
+    chars = normalize_custom_chars(fn.read_text(encoding="utf-8"))
+    if not chars:
+        raise ValueError(f"{CUSTOM_CHARSET_FILENAME} rỗng.")
+    if len(chars) > len(VI_MAPPING_ORDER):
+        raise ValueError(
+            f"{CUSTOM_CHARSET_FILENAME} có {len(chars)} ký tự; tối đa {len(VI_MAPPING_ORDER)}."
+        )
+    return chars
+
+
+def save_custom_charset(folder: Path, chars: str):
+    (folder / CUSTOM_CHARSET_FILENAME).write_text(chars, encoding="utf-8")
 
 
 # -----------------------------------------------------------------------------
@@ -136,11 +181,14 @@ def save_fnt(path: Path, header: bytearray, glyphs: list[Glyph], tail: bytes):
     path.write_bytes(bytes(hdr) + b"".join(g.pack() for g in glyphs) + tail)
 
 
-def validate_fixed_indices(glyphs: list[Glyph]):
-    if len(glyphs) <= FIXED_END_INDEX:
+def validate_fixed_indices(glyphs: list[Glyph], char_count: int = FIXED_COUNT):
+    if char_count <= 0:
+        raise ValueError("Danh sách ký tự custom đang rỗng.")
+    end_index = FIXED_START_INDEX + char_count - 1
+    if len(glyphs) <= end_index:
         raise ValueError(
             f"Font chỉ có {len(glyphs)} glyph; fixed map cần ít nhất "
-            f"{FIXED_END_INDEX + 1} glyph để dùng FNT #{FIXED_START_INDEX}..#{FIXED_END_INDEX}."
+            f"{end_index + 1} glyph để dùng FNT #{FIXED_START_INDEX}..#{end_index}."
         )
 
 
@@ -159,17 +207,16 @@ def decode_fnt_code(code: int) -> str | None:
         return None
 
 
-def fixed_index_byte_map(glyphs: list[Glyph]):
+def fixed_index_byte_map(glyphs: list[Glyph], chars: str = VI_MAPPING_ORDER):
     """Return exact fixed-index mapping based on codes already present in FNT.
 
-    char -> raw bytes from glyph record at FIXED_START_INDEX + mapping order.
-    No JSON and no F040 assumptions.
+    char -> raw bytes from glyph record at FIXED_START_INDEX + custom mapping order.
     """
-    validate_fixed_indices(glyphs)
+    validate_fixed_indices(glyphs, len(chars))
     out: dict[str, bytes] = {}
     seen: dict[bytes, str] = {}
     rows = []
-    for order, char in enumerate(VI_MAPPING_ORDER, 1):
+    for order, char in enumerate(chars, 1):
         idx = FIXED_START_INDEX + order - 1
         code = glyphs[idx].code
         raw = code_to_raw_bytes(code)
@@ -804,10 +851,10 @@ def replace_utf8_sequences_fixed(raw: bytes, char_to_bytes: dict[str, bytes]):
     return bytes(out), sum(counts.values()), counts
 
 
-def count_utf8_fixed_sequences(raw: bytes) -> int:
-    """Count fixed-map Vietnamese characters present as literal UTF-8 bytes."""
+def count_utf8_fixed_sequences(raw: bytes, chars) -> int:
+    """Count fixed-map characters present as literal UTF-8 bytes."""
     total = 0
-    for c in VI_MAPPING_ORDER:
+    for c in chars:
         total += raw.count(c.encode("utf-8"))
     return total
 
@@ -889,21 +936,23 @@ class FontToolTab(ttk.Frame):
             row=1, column=8, columnspan=2, sticky="w", padx=6, pady=(4, 0)
         )
 
-        mapbox = ttk.LabelFrame(self, text="Built-in fixed-index map", padding=10)
+        mapbox = ttk.LabelFrame(self, text="Custom ký tự muốn tạo", padding=10)
         mapbox.pack(fill="x", pady=(10, 0))
         ttk.Label(
             mapbox,
             text=(
-                f"FNT #{FIXED_START_INDEX} (row {FIXED_START_INDEX + 1}) = á  →  "
-                f"FNT #{FIXED_END_INDEX} = Ỵ.  "
-                "Font Tool giữ nguyên code của từng FNT record; chỉ thay bitmap/metrics."
+                f"Nhập chuỗi ký tự theo đúng thứ tự muốn build. Tool sẽ ghi từ FNT #{FIXED_START_INDEX} trở đi. "
+                f"Tối đa {len(VI_MAPPING_ORDER)} ký tự. Thứ tự này sẽ được lưu vào {CUSTOM_CHARSET_FILENAME} để Editor/Replace dùng cùng map."
             ),
             wraplength=1050,
         ).pack(anchor="w")
-        fixed = tk.Text(mapbox, height=3, wrap="char")
-        fixed.pack(fill="x", pady=(6, 0))
-        fixed.insert("1.0", VI_MAPPING_ORDER)
-        fixed.configure(state="disabled")
+        self.custom_chars_text = tk.Text(mapbox, height=4, wrap="char")
+        self.custom_chars_text.pack(fill="x", pady=(6, 0))
+        self.custom_chars_text.insert("1.0", VI_MAPPING_ORDER)
+        row2 = ttk.Frame(mapbox)
+        row2.pack(fill="x", pady=(6, 0))
+        ttk.Button(row2, text="Restore default 134", command=self.restore_default_chars).pack(side="left")
+        ttk.Label(row2, text="Lưu ý: trùng ký tự sẽ tự bỏ bớt, xuống dòng/space sẽ bị bỏ.").pack(side="left", padx=10)
 
         actions = ttk.Frame(self)
         actions.pack(fill="x", pady=10)
@@ -918,6 +967,18 @@ class FontToolTab(ttk.Frame):
         self.log.configure(yscrollcommand=ys.set)
         self.log.pack(side="left", fill="both", expand=True)
         ys.pack(side="right", fill="y")
+
+    def restore_default_chars(self):
+        self.custom_chars_text.delete("1.0", "end")
+        self.custom_chars_text.insert("1.0", VI_MAPPING_ORDER)
+
+    def get_build_chars(self) -> str:
+        chars = normalize_custom_chars(self.custom_chars_text.get("1.0", "end-1c"))
+        if not chars:
+            raise ValueError("Khung custom ký tự đang rỗng.")
+        if len(chars) > len(VI_MAPPING_ORDER):
+            raise ValueError(f"Tối đa {len(VI_MAPPING_ORDER)} ký tự custom.")
+        return chars
 
     def choose_src(self):
         p = filedialog.askdirectory(title="Folder chứa Font00.fnt + Font_0000..0013.gxt.gz")
@@ -980,11 +1041,13 @@ class FontToolTab(ttk.Frame):
         try:
             self.log.clear()
             src, _ = self.validate_inputs(need_ttf=False)
+            chars = self.get_build_chars()
+            end_index = fixed_end_for(chars)
             header, glyphs, tail = load_fnt(src / "Font00.fnt")
-            validate_fixed_indices(glyphs)
-            _, rows = fixed_index_byte_map(glyphs)
+            validate_fixed_indices(glyphs, len(chars))
+            _, rows = fixed_index_byte_map(glyphs, chars)
             self.log.write_line(f"Glyph records: {len(glyphs)}")
-            self.log.write_line(f"Fixed block: FNT #{FIXED_START_INDEX}..#{FIXED_END_INDEX} ({FIXED_COUNT} glyphs)")
+            self.log.write_line(f"Fixed block: FNT #{FIXED_START_INDEX}..#{end_index} ({len(chars)} glyphs)")
             self.log.write_line(f"Atlas count in header: {struct.unpack_from('<H', header, 0x38)[0]}")
             self.log.write_line("")
             self.log.write_line("First 12 fixed mappings from this FNT:")
@@ -1030,9 +1093,11 @@ class FontToolTab(ttk.Frame):
 
             self.log.clear()
             self.log.write_line("Loading Font00.fnt…")
+            chars = self.get_build_chars()
+            end_index = fixed_end_for(chars)
             header, glyphs, tail = load_fnt(src / "Font00.fnt")
-            validate_fixed_indices(glyphs)
-            _, before_rows = fixed_index_byte_map(glyphs)  # also validates unique codes
+            validate_fixed_indices(glyphs, len(chars))
+            _, before_rows = fixed_index_byte_map(glyphs, chars)  # also validates unique codes
 
             if self.auto_fit_var.get():
                 font_size, baseline, cell_h, advance, fit_score = auto_fit_font_metrics(ttf, glyphs)
@@ -1047,7 +1112,7 @@ class FontToolTab(ttk.Frame):
             ascii_metrics = stock_ascii_metrics(glyphs)
             if self.auto_all_negtop_var.get():
                 self.log.write_line(
-                    f"Auto Neg Top toàn bộ: ON ({FIXED_COUNT} ký tự); "
+                    f"Auto Neg Top toàn bộ: ON ({len(chars)} ký tự); "
                     "mỗi glyph neo thân theo Latin gốc, độ lệch dấu lấy từ TTF."
                 )
                 self.log.write_line(
@@ -1055,7 +1120,7 @@ class FontToolTab(ttk.Frame):
                 )
 
             self.log.write_line(
-                f"Fixed-index mode: FNT #{FIXED_START_INDEX}..#{FIXED_END_INDEX}; "
+                f"Fixed-index mode: FNT #{FIXED_START_INDEX}..#{end_index}; "
                 "code của record được giữ nguyên."
             )
             self.log.write_line("Loading atlas pages 0000..0013…")
@@ -1063,11 +1128,11 @@ class FontToolTab(ttk.Frame):
             for p in range(PAGE_COUNT):
                 pages[p] = list(read_gxt(src / f"Font_{p:04d}.gxt.gz"))
 
-            target_indices = set(range(FIXED_START_INDEX, FIXED_END_INDEX + 1))
+            target_indices = set(range(FIXED_START_INDEX, end_index + 1))
             occ = build_occupancy(glyphs, padding, exclude_indices=target_indices)
             dirty_pages = set()
 
-            for order, char in enumerate(VI_MAPPING_ORDER, 1):
+            for order, char in enumerate(chars, 1):
                 fnt_idx = FIXED_START_INDEX + order - 1
                 old = glyphs[fnt_idx]
                 preserved_code = old.code
@@ -1120,7 +1185,7 @@ class FontToolTab(ttk.Frame):
                         overflow = max(0, top + h - cell_h)
                         auto_note += f" below+{overflow}px"
                 self.log.write_line(
-                    f"[{order:03d}/{FIXED_COUNT}] FNT #{fnt_idx:04d}  {char}  "
+                    f"[{order:03d}/{len(chars)}] FNT #{fnt_idx:04d}  {char}  "
                     f"code=0x{preserved_code:04X} [{raw.hex(' ').upper()}]  "
                     f"page {page:02d} ({ax},{ay}) {w}x{h} adv={char_advance} top={top}"
                     f" negTop={-top}{auto_note}"
@@ -1139,7 +1204,8 @@ class FontToolTab(ttk.Frame):
             save_fnt(out / "Font00.fnt", header, glyphs, tail)
 
             # Audit table only; tools never read it.
-            _, rows = fixed_index_byte_map(glyphs)
+            save_custom_charset(out, chars)
+            _, rows = fixed_index_byte_map(glyphs, chars)
             with open(out / "dfci_fixed_index_map.tsv", "w", encoding="utf-8", newline="\n") as f:
                 f.write("order\tfnt_index\tdisplay_row\tchar\tunicode\tfnt_code\traw_bytes\tcp932_placeholder\n")
                 for order, idx, char, code, raw, placeholder in rows:
@@ -1149,7 +1215,7 @@ class FontToolTab(ttk.Frame):
                     )
 
             self.log.write_line("")
-            self.log.write_line(f"Done. Replaced exactly {FIXED_COUNT} fixed FNT records; glyph count unchanged: {len(glyphs)}.")
+            self.log.write_line(f"Done. Replaced exactly {len(chars)} fixed FNT records; glyph count unchanged: {len(glyphs)}.")
             self.log.write_line(f"Dirty pages: {', '.join(f'{p:04d}' for p in sorted(dirty_pages))}")
             self.log.write_line(f"Output: {out}")
             self.log.write_line("Không tạo/đọc vi_mapping.json.")
@@ -1319,7 +1385,10 @@ class FontEditorTab(ttk.Frame):
             if not folder.is_dir():
                 raise ValueError("Font folder không hợp lệ.")
             self.header, self.glyphs, self.tail = load_fnt(folder / "Font00.fnt")
-            validate_fixed_indices(self.glyphs)
+            self.active_chars = load_custom_charset(folder)
+            self.active_char_to_index, self.active_index_to_char = index_maps_for(self.active_chars)
+            self.active_end_index = fixed_end_for(self.active_chars)
+            validate_fixed_indices(self.glyphs, len(self.active_chars))
             self.pages = {}
             for p in range(PAGE_COUNT):
                 fn = folder / f"Font_{p:04d}.gxt.gz"
@@ -1327,7 +1396,7 @@ class FontEditorTab(ttk.Frame):
                     raise ValueError(f"Thiếu {fn.name}.")
                 self.pages[p] = list(read_gxt(fn))
             # Validate code uniqueness for Replace Tool too.
-            _, rows = fixed_index_byte_map(self.glyphs)
+            _, rows = fixed_index_byte_map(self.glyphs, self.active_chars)
             self.selected_index = None
             self.refresh_tree()
 
@@ -1338,16 +1407,16 @@ class FontEditorTab(ttk.Frame):
                 self.tree.see(iid)
                 self.on_select()
             self.status_var.set(
-                f"Đã load {len(self.glyphs)} glyph. Fixed map: FNT #{FIXED_START_INDEX}..#{FIXED_END_INDEX}; "
-                "không dùng vi_mapping.json."
+                f"Đã load {len(self.glyphs)} glyph. Fixed map: FNT #{FIXED_START_INDEX}..#{self.active_end_index}; "
+                f"{len(self.active_chars)} ký tự; custom từ {CUSTOM_CHARSET_FILENAME} nếu có."
             )
             self.aio.replace_tab.font_var.set(str(folder))
         except Exception as e:
             messagebox.showerror("Load font", str(e))
 
     def display_char(self, idx: int, g: Glyph):
-        if self.show_vi_var.get() and idx in VI_INDEX_TO_CHAR:
-            return VI_INDEX_TO_CHAR[idx]
+        if self.show_vi_var.get() and idx in self.active_index_to_char:
+            return self.active_index_to_char[idx]
         c = decode_fnt_code(g.code)
         if c is None:
             return "?"
@@ -1364,7 +1433,7 @@ class FontEditorTab(ttk.Frame):
         for idx, g in enumerate(self.glyphs):
             disp = self.display_char(idx, g)
             code = f"0x{g.code:04X}" if g.code <= 0xFFFF else f"0x{g.code:X}"
-            map_order = idx - FIXED_START_INDEX + 1 if idx in VI_INDEX_TO_CHAR else "-"
+            map_order = idx - FIXED_START_INDEX + 1 if idx in self.active_index_to_char else "-"
             hay = f"{idx} {disp} {code} {g.page} {g.atlas_x},{g.atlas_y} {g.width}x{g.height}".lower()
             if q and q not in hay:
                 continue
@@ -1440,8 +1509,8 @@ class FontEditorTab(ttk.Frame):
                     raise ValueError(f"{name} vượt phạm vi signed 16-bit.")
 
             # Fixed block may change code, but raw bytes must stay unique so Replace Tool remains deterministic.
-            if idx in VI_INDEX_TO_CHAR:
-                for other_idx in range(FIXED_START_INDEX, FIXED_END_INDEX + 1):
+            if idx in self.active_index_to_char:
+                for other_idx in range(FIXED_START_INDEX, self.active_end_index + 1):
                     if other_idx != idx and self.glyphs[other_idx].code == code:
                         raise ValueError(
                             f"Code 0x{code:04X} đã được FNT #{other_idx} dùng trong fixed map; "
@@ -1568,7 +1637,7 @@ class FontEditorTab(ttk.Frame):
                 return
             out = Path(folder)
             img = glyph_alpha_from_page(self.pages[g.page][1], g)
-            vi = VI_INDEX_TO_CHAR.get(self.selected_index)
+            vi = self.active_index_to_char.get(self.selected_index)
             suffix = f"_{vi}" if vi else ""
             safe = f"{self.selected_index:04d}_0x{g.code:04X}{suffix}"
             img.save(out / f"{safe}.png")
@@ -1697,14 +1766,14 @@ class FontEditorTab(ttk.Frame):
                 disp = self.display_char(idx, g)
                 fn = None
                 if 0 <= g.page < PAGE_COUNT and g.width > 0 and g.height > 0:
-                    vi = VI_INDEX_TO_CHAR.get(idx)
+                    vi = self.active_index_to_char.get(idx)
                     suffix = f"_{vi}" if vi else ""
                     fn = f"{idx:04d}_0x{g.code:04X}{suffix}.png"
                     glyph_alpha_from_page(self.pages[g.page][1], g).save(glyph_dir / fn)
                 manifest.append({
                     "index": idx,
                     "display": disp,
-                    "fixed_vi": VI_INDEX_TO_CHAR.get(idx),
+                    "fixed_vi": self.active_index_to_char.get(idx),
                     "code": f"0x{g.code:04X}",
                     "page": g.page,
                     "x": g.atlas_x,
@@ -1793,8 +1862,8 @@ class ReplaceToolTab(ttk.Frame):
         ttk.Label(
             self,
             text=(
-                f"Built-in map: {FIXED_COUNT} ký tự. Replace Tool KHÔNG dùng vi_mapping.json và KHÔNG giả định F040. "
-                f"Nó đọc code thật tại FNT #{FIXED_START_INDEX}..#{FIXED_END_INDEX}, rồi ghi đúng raw byte của từng code. "
+                f"Map mặc định: {FIXED_COUNT} ký tự, nhưng nếu font folder có {CUSTOM_CHARSET_FILENAME} thì Replace Tool sẽ dùng map custom đó. "
+                f"Nó đọc code thật tại FNT #{FIXED_START_INDEX} trở đi, rồi ghi đúng raw byte của từng code. "
                 "Nhận TXT/CSV/TSV và các file text phổ biến; có thể chọn cả thư mục hoặc một file. "
                 "Workflow an toàn: CP932 → folder UTF8 để dịch/sửa → Replace để encode ngược về game + fixed-index. "
                 "CSV/TSV trong folder UTF8 được ghi UTF-8 BOM để Excel giữ đúng tiếng Nhật."
@@ -1968,15 +2037,16 @@ class ReplaceToolTab(ttk.Frame):
         if not fnt.is_file():
             raise ValueError("Thiếu Font00.fnt trong font folder.")
         _, glyphs, _ = load_fnt(fnt)
-        char_to_bytes, rows = fixed_index_byte_map(glyphs)
-        return glyphs, char_to_bytes, rows
+        active_chars = load_custom_charset(font_folder)
+        char_to_bytes, rows = fixed_index_byte_map(glyphs, active_chars)
+        return glyphs, char_to_bytes, rows, active_chars
 
     def analyze_map(self):
         try:
             self.log.clear()
-            glyphs, mp, rows = self.load_fixed_map()
+            glyphs, mp, rows, active_chars = self.load_fixed_map()
             self.log.write_line(f"Font glyphs: {len(glyphs)}")
-            self.log.write_line(f"Fixed block: #{FIXED_START_INDEX}..#{FIXED_END_INDEX}")
+            self.log.write_line(f"Fixed block: #{FIXED_START_INDEX}..#{fixed_end_for(active_chars)}")
             self.log.write_line(f"Map entries: {len(mp)}")
             self.log.write_line("")
             for order, idx, char, code, raw, placeholder in rows[:20]:
@@ -2001,7 +2071,7 @@ class ReplaceToolTab(ttk.Frame):
             src = Path(self.folder_var.get()).resolve()
             if not src.exists() or not (src.is_dir() or src.is_file()):
                 raise ValueError("Chưa chọn file hoặc thư mục text/CSV hợp lệ.")
-            glyphs, char_to_bytes, rows = self.load_fixed_map()
+            glyphs, char_to_bytes, rows, active_chars = self.load_fixed_map()
 
             single_file = src.is_file()
             if single_file:
@@ -2028,8 +2098,8 @@ class ReplaceToolTab(ttk.Frame):
             self.log.write_line(f"UTF8/Text source : {src}")
             self.log.write_line(f"GAME output      : {dst}")
             self.log.write_line(
-                f"Map    : fixed FNT index #{FIXED_START_INDEX}..#{FIXED_END_INDEX}; "
-                "không dùng vi_mapping.json"
+                f"Map    : fixed FNT index #{FIXED_START_INDEX}..#{fixed_end_for(active_chars)}; "
+                f"{len(active_chars)} ký tự custom nếu có"
             )
             self.log.write_line("")
 
@@ -2057,7 +2127,7 @@ class ReplaceToolTab(ttk.Frame):
                 # a naive CP932 fallback turns the Vietnamese into mojibake before
                 # replacement. Detect literal UTF-8 Vietnamese bytes first and
                 # replace them directly while preserving all other bytes.
-                utf8_hits = count_utf8_fixed_sequences(raw) if ext in {".csv", ".tsv"} else 0
+                utf8_hits = count_utf8_fixed_sequences(raw, active_chars) if ext in {".csv", ".tsv"} else 0
                 use_raw_utf8 = False
                 if utf8_hits:
                     try:
@@ -2099,7 +2169,7 @@ class ReplaceToolTab(ttk.Frame):
 
                     text, enc = dec
                     text = unicodedata.normalize("NFC", text)
-                    n_expected = sum(text.count(c) for c in VI_MAPPING_ORDER)
+                    n_expected = sum(text.count(c) for c in active_chars)
                     if n_expected == 0:
                         if single_file:
                             out.write_bytes(raw)
@@ -2195,8 +2265,8 @@ class DFCIAIO(tk.Tk):
         footer = ttk.Label(
             self,
             text=(
-                f"Fixed-index master map: FNT #{FIXED_START_INDEX}=á … #{FIXED_END_INDEX}=Ỵ | "
-                "Không dùng vi_mapping.json | Workflow: CP932 → UTF8 → GAME + fixed-index replace"
+                f"Fixed-index start: FNT #{FIXED_START_INDEX} | "
+                f"Custom order lưu trong {CUSTOM_CHARSET_FILENAME} | Workflow: CP932 → UTF8 → GAME + fixed-index replace"
             ),
             anchor="w",
         )
@@ -2205,5 +2275,5 @@ class DFCIAIO(tk.Tk):
 
 if __name__ == "__main__":
     if len(VI_MAPPING_ORDER) != 134 or len(set(VI_MAPPING_ORDER)) != 134:
-        raise SystemExit("Internal error: Vietnamese fixed map must contain exactly 134 unique characters.")
+        raise SystemExit("Internal error: default Vietnamese fixed map must contain exactly 134 unique characters.")
     DFCIAIO().mainloop()
