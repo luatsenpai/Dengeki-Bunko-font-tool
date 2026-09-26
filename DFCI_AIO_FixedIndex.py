@@ -52,7 +52,7 @@ except ImportError:
 # Shared fixed-index mapping
 # -----------------------------------------------------------------------------
 
-APP_TITLE = "DFCI AIO - Fixed Index v11"
+APP_TITLE = "DFCI AIO - Fixed Index v12"
 FNT_HEADER_SIZE = 0x3E
 GLYPH_RECORD_SIZE = 0x16
 GXT_HEADER_SIZE = 0x40
@@ -716,58 +716,93 @@ def decode_text(raw: bytes, ext: str):
 def decode_to_unicode_for_utf8_export(raw: bytes, ext: str):
     """Decode a source text file for the CP932 -> UTF-8 staging workflow.
 
-    Preference is explicit Unicode BOM -> UTF-8 -> CP932 -> CP1258 (tables).
-    The function returns (text, source_encoding) or None for binary/unsupported
-    files. It intentionally does not reinterpret fixed-index game bytes back to
-    Vietnamese because those bytes are ambiguous with legitimate CP932 text.
+    BOMs are treated as hints, not absolute truth. Some game CSVs have a UTF-8
+    BOM prepended to a CP932 body; older versions crashed immediately when the
+    body failed strict UTF-8 decoding. This version falls back safely while
+    stripping only the detected BOM bytes.
+
+    Returns (text, source_encoding) or None for binary/unsupported files.
     """
     ext = ext.lower()
     is_table = ext in {".csv", ".tsv"}
 
-    if raw.startswith(codecs.BOM_UTF8):
-        return raw[3:].decode("utf-8"), "utf-8-sig"
-    if raw.startswith(codecs.BOM_UTF16_LE):
-        return raw[2:].decode("utf-16-le"), "utf-16-le"
-    if raw.startswith(codecs.BOM_UTF16_BE):
-        return raw[2:].decode("utf-16-be"), "utf-16-be"
-    if raw.startswith(codecs.BOM_UTF32_LE):
-        return raw[4:].decode("utf-32-le"), "utf-32-le"
-    if raw.startswith(codecs.BOM_UTF32_BE):
-        return raw[4:].decode("utf-32-be"), "utf-32-be"
+    # Keep both the original bytes and a BOM-stripped candidate.  If the codec
+    # declared by the BOM fails, continue trying other text codecs on the body.
+    body = raw
+    bom_note = ""
 
-    # UTF-16 without BOM is common in spreadsheet exports.
-    if is_table and raw:
-        probe = raw[:4096]
+    if raw.startswith(codecs.BOM_UTF8):
+        body = raw[len(codecs.BOM_UTF8):]
+        try:
+            return body.decode("utf-8"), "utf-8-sig"
+        except UnicodeDecodeError:
+            bom_note = "utf-8 BOM + "
+
+    elif raw.startswith(codecs.BOM_UTF32_LE):
+        body = raw[len(codecs.BOM_UTF32_LE):]
+        try:
+            return body.decode("utf-32-le"), "utf-32-le"
+        except UnicodeDecodeError:
+            bom_note = "utf-32-le BOM + "
+
+    elif raw.startswith(codecs.BOM_UTF32_BE):
+        body = raw[len(codecs.BOM_UTF32_BE):]
+        try:
+            return body.decode("utf-32-be"), "utf-32-be"
+        except UnicodeDecodeError:
+            bom_note = "utf-32-be BOM + "
+
+    elif raw.startswith(codecs.BOM_UTF16_LE):
+        body = raw[len(codecs.BOM_UTF16_LE):]
+        try:
+            return body.decode("utf-16-le"), "utf-16-le"
+        except UnicodeDecodeError:
+            bom_note = "utf-16-le BOM + "
+
+    elif raw.startswith(codecs.BOM_UTF16_BE):
+        body = raw[len(codecs.BOM_UTF16_BE):]
+        try:
+            return body.decode("utf-16-be"), "utf-16-be"
+        except UnicodeDecodeError:
+            bom_note = "utf-16-be BOM + "
+
+    # UTF-16 without BOM is common in spreadsheet exports. Do this on the body
+    # after stripping a bogus BOM, otherwise the BOM bytes can skew the NUL test.
+    if is_table and body:
+        probe = body[:4096]
         even_nuls = sum(1 for i in range(0, len(probe), 2) if probe[i] == 0)
         odd_nuls = sum(1 for i in range(1, len(probe), 2) if probe[i] == 0)
         even_slots = max(1, (len(probe) + 1) // 2)
         odd_slots = max(1, len(probe) // 2)
         try:
             if odd_nuls / odd_slots > 0.25 and even_nuls / even_slots < 0.10:
-                return raw.decode("utf-16-le"), "utf-16-le(no-bom)"
+                return body.decode("utf-16-le"), bom_note + "utf-16-le(no-bom)"
             if even_nuls / even_slots > 0.25 and odd_nuls / odd_slots < 0.10:
-                return raw.decode("utf-16-be"), "utf-16-be(no-bom)"
+                return body.decode("utf-16-be"), bom_note + "utf-16-be(no-bom)"
         except UnicodeDecodeError:
             pass
 
-    if looks_binary(raw):
+    # Binary detection is applied to the BOM-stripped payload. A bogus UTF-8
+    # BOM followed by CP932 text should not be rejected just because the BOM lied.
+    if looks_binary(body):
         return None
 
-    # Already UTF-8: keep it valid and normalize the staging folder to UTF-8.
+    # Already UTF-8 without a reliable BOM.
     try:
-        return raw.decode("utf-8"), "utf-8"
+        return body.decode("utf-8"), bom_note + "utf-8"
     except UnicodeDecodeError:
         pass
 
-    # Original DFCI text is normally CP932. This is the key conversion path.
+    # Normal DFCI source path, including the important case:
+    #   EF BB BF + CP932 body
     try:
-        return raw.decode("cp932"), "cp932"
+        return body.decode("cp932"), bom_note + "cp932"
     except UnicodeDecodeError:
         pass
 
     if is_table:
         try:
-            return raw.decode("cp1258"), "cp1258"
+            return body.decode("cp1258"), bom_note + "cp1258"
         except UnicodeDecodeError:
             pass
 
@@ -1972,7 +2007,11 @@ class ReplaceToolTab(ttk.Frame):
                     self.log.write_line(f"COPY      {label}  [non-text]")
                     return
 
-                dec = decode_to_unicode_for_utf8_export(raw, ext)
+                try:
+                    dec = decode_to_unicode_for_utf8_export(raw, ext)
+                except UnicodeError as e:
+                    dec = None
+                    self.log.write_line(f"DECODE?   {label}  [{type(e).__name__}: {e}; giữ nguyên]")
                 if dec is None:
                     out.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(inp, out)
