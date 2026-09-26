@@ -35,6 +35,7 @@ import shutil
 import struct
 import sys
 import traceback
+import unicodedata
 import statistics
 import unicodedata
 from dataclasses import dataclass
@@ -676,6 +677,9 @@ class FixedTextEncodeError(Exception):
 
 def encode_fixed_index_cp932(text: str, char_to_bytes: dict[str, bytes]):
     """Encode text to CP932 while writing mapped Vietnamese chars as exact FNT bytes."""
+    # Normalize decomposed Vietnamese (NFD) from spreadsheets/editors to the
+    # precomposed characters used by the fixed 134-character map.
+    text = unicodedata.normalize("NFC", text)
     out = bytearray()
     replaced = 0
     for pos, c in enumerate(text):
@@ -689,6 +693,53 @@ def encode_fixed_index_cp932(text: str, char_to_bytes: dict[str, bytes]):
         except UnicodeEncodeError as e:
             raise FixedTextEncodeError(c, pos) from e
     return bytes(out), replaced
+
+
+def replace_utf8_sequences_fixed(raw: bytes, char_to_bytes: dict[str, bytes]):
+    """Replace UTF-8 Vietnamese sequences directly in a raw byte stream.
+
+    This is for game CSV/TSV files that are *mixed encoding*: translated fields
+    are UTF-8 while untouched Japanese fields remain CP932. Such a file cannot
+    be decoded correctly as one global codec. We therefore replace only exact
+    UTF-8 byte sequences for the 134 mapped Vietnamese characters and preserve
+    every other byte verbatim.
+
+    The scanner is single-pass over the original bytes, so replacement bytes are
+    never scanned again and cannot trigger accidental cascading replacements.
+    """
+    groups: dict[int, list[tuple[bytes, str, bytes]]] = {}
+    for c in VI_MAPPING_ORDER:
+        pat = c.encode("utf-8")
+        repl = char_to_bytes[c]
+        groups.setdefault(pat[0], []).append((pat, c, repl))
+    for entries in groups.values():
+        entries.sort(key=lambda item: len(item[0]), reverse=True)
+
+    out = bytearray()
+    counts: dict[str, int] = {}
+    i = 0
+    n = len(raw)
+    while i < n:
+        matched = False
+        for pat, c, repl in groups.get(raw[i], ()):
+            if raw.startswith(pat, i):
+                out.extend(repl)
+                counts[c] = counts.get(c, 0) + 1
+                i += len(pat)
+                matched = True
+                break
+        if not matched:
+            out.append(raw[i])
+            i += 1
+    return bytes(out), sum(counts.values()), counts
+
+
+def count_utf8_fixed_sequences(raw: bytes) -> int:
+    """Count fixed-map Vietnamese characters present as literal UTF-8 bytes."""
+    total = 0
+    for c in VI_MAPPING_ORDER:
+        total += raw.count(c.encode("utf-8"))
+    return total
 
 
 # -----------------------------------------------------------------------------
@@ -1675,7 +1726,7 @@ class ReplaceToolTab(ttk.Frame):
                 f"Built-in map: {FIXED_COUNT} ký tự. Replace Tool KHÔNG dùng vi_mapping.json và KHÔNG giả định F040. "
                 f"Nó đọc code thật tại FNT #{FIXED_START_INDEX}..#{FIXED_END_INDEX}, rồi ghi đúng raw byte của từng code. "
                 "Nhận TXT/CSV/TSV và các file text phổ biến; có thể chọn cả thư mục hoặc một file. "
-                "File có thay đổi được xuất CP932."
+                "Hỗ trợ cả CSV UTF-8 thuần và CSV mixed UTF-8 + CP932; file có thay đổi được ghi bằng raw byte fixed-index."
             ),
             wraplength=1000,
         ).pack(anchor="w", pady=(10, 0))
@@ -1805,40 +1856,81 @@ class ReplaceToolTab(ttk.Frame):
                 nonlocal files_total, files_changed, replacements, binaries
                 files_total += 1
                 raw = inp.read_bytes()
-                dec = decode_text(raw, inp.suffix)
-                if dec is None:
-                    if single_file:
-                        raise ValueError(
-                            f"Không nhận diện được {inp.name} là text/CSV hỗ trợ. "
-                            "Hỗ trợ CSV UTF-8, UTF-8 BOM, UTF-16 LE/BE, CP932 và CP1258."
-                        )
-                    shutil.copy2(inp, out)
-                    binaries += 1
-                    self.log.write_line(f"COPY      {label}")
-                    return
+                ext = inp.suffix.lower()
 
-                text, enc = dec
-                n_expected = sum(text.count(c) for c in VI_MAPPING_ORDER)
-                if n_expected == 0:
-                    if single_file:
-                        out.write_bytes(raw)
-                        try:
-                            shutil.copystat(inp, out)
-                        except Exception:
-                            pass
-                    else:
+                # First try normal whole-file decoding.  Pure UTF-8 CSV follows
+                # this path and is normalized to NFC before fixed-map encoding.
+                dec = decode_text(raw, ext)
+
+                # Important: a common DFCI workflow produces a mixed CSV where
+                # translated Vietnamese fields are UTF-8 but untouched Japanese
+                # fields are still CP932.  Whole-file UTF-8 decoding fails, then
+                # a naive CP932 fallback turns the Vietnamese into mojibake before
+                # replacement. Detect literal UTF-8 Vietnamese bytes first and
+                # replace them directly while preserving all other bytes.
+                utf8_hits = count_utf8_fixed_sequences(raw) if ext in {".csv", ".tsv"} else 0
+                use_raw_utf8 = False
+                if utf8_hits:
+                    try:
+                        # If the whole file is valid UTF-8, use the normal text
+                        # path so other Unicode characters are encoded to CP932.
+                        probe = raw[3:] if raw.startswith(codecs.BOM_UTF8) else raw
+                        probe.decode("utf-8")
+                    except UnicodeDecodeError:
+                        use_raw_utf8 = True
+
+                if use_raw_utf8:
+                    raw_body = raw[3:] if raw.startswith(codecs.BOM_UTF8) else raw
+                    outbytes, n, per_char = replace_utf8_sequences_fixed(raw_body, char_to_bytes)
+                    enc = "mixed UTF-8 + CP932"
+                    if n == 0:
+                        if single_file:
+                            out.write_bytes(raw)
+                            try:
+                                shutil.copystat(inp, out)
+                            except Exception:
+                                pass
+                        else:
+                            shutil.copy2(inp, out)
+                        self.log.write_line(f"UNCHANGED {label}  [{enc}]")
+                        return
+                    detail = " ".join(f"{c}:{cnt}" for c, cnt in per_char.items())
+                    self.log.write_line(f"MIXED     {label}  UTF-8 glyph hits={n}  {detail}")
+                else:
+                    if dec is None:
+                        if single_file:
+                            raise ValueError(
+                                f"Không nhận diện được {inp.name} là text/CSV hỗ trợ. "
+                                "Hỗ trợ CSV UTF-8, UTF-8 BOM, UTF-16 LE/BE, CP932, CP1258 và CSV mixed UTF-8+CP932."
+                            )
                         shutil.copy2(inp, out)
-                    self.log.write_line(f"UNCHANGED {label}  [{enc}]")
-                    return
+                        binaries += 1
+                        self.log.write_line(f"COPY      {label}")
+                        return
 
-                try:
-                    outbytes, n = encode_fixed_index_cp932(text, char_to_bytes)
-                except FixedTextEncodeError as e:
-                    raise RuntimeError(
-                        f"{label} còn ký tự không encode được CP932: {e.char!r} "
-                        f"(vị trí {e.position}).\n"
-                        "Ký tự Việt trong fixed map được xử lý trực tiếp bằng raw byte; lỗi này là ký tự khác ngoài CP932."
-                    ) from e
+                    text, enc = dec
+                    text = unicodedata.normalize("NFC", text)
+                    n_expected = sum(text.count(c) for c in VI_MAPPING_ORDER)
+                    if n_expected == 0:
+                        if single_file:
+                            out.write_bytes(raw)
+                            try:
+                                shutil.copystat(inp, out)
+                            except Exception:
+                                pass
+                        else:
+                            shutil.copy2(inp, out)
+                        self.log.write_line(f"UNCHANGED {label}  [{enc}]")
+                        return
+
+                    try:
+                        outbytes, n = encode_fixed_index_cp932(text, char_to_bytes)
+                    except FixedTextEncodeError as e:
+                        raise RuntimeError(
+                            f"{label} còn ký tự không encode được CP932: {e.char!r} "
+                            f"(vị trí {e.position}).\n"
+                            "Ký tự Việt trong fixed map được xử lý trực tiếp bằng raw byte; lỗi này là ký tự khác ngoài CP932."
+                        ) from e
 
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_bytes(outbytes)
@@ -1848,7 +1940,7 @@ class ReplaceToolTab(ttk.Frame):
                     pass
                 files_changed += 1
                 replacements += n
-                self.log.write_line(f"REPLACE   {label}  [{enc} -> CP932 fixed-index]  {n}")
+                self.log.write_line(f"REPLACE   {label}  [{enc} -> fixed-index bytes]  {n}")
 
             if single_file:
                 process_one(src, dst, src.name)
